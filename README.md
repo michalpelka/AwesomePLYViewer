@@ -48,7 +48,7 @@ only need `raylib`.
 4. **Orbit camera**: right/up/forward basis and pinhole projection.
 5. **Project**: `Σ' = J W Σ Wᵀ Jᵀ` plus a 0.3 px² low-pass filter. **5b**: view-dependent color from SH degrees 0–3.
 6. **Ellipse**: eigen-decomposition of the 2×2 `Σ'` gives the axes and the 1-sigma radii.
-7. **Sort** back to front with a 16-bit counting sort.
+7. **Sort** back to front with `std::sort`. This is simple but not optimal: a 16-bit counting/radix sort is about 10× faster.
 8. **Draw** one quad per splat; the fragment shader evaluates `opacity · exp(-½|uv|²)` and alpha blending composites.
 
 ## Example scenes (not included, CMake can download them)
@@ -67,6 +67,7 @@ Files already in `examples/` are skipped, so re-running configure does not downl
 
 ## Limits
 
-Everything is on the CPU. At about 1M splats a frame takes roughly 18 ms to project, 8 ms to sort and 130 ms to
-submit through raylib's immediate mode, so large captures are slow. The next step for speed is moving projection
-into a vertex shader. Compressed formats (`.spz`, compressed `.ply`) are not supported.
+Everything is on the CPU. On the train scene (580k visible splats) a frame takes about 25 ms to project and shade
+(with SH), 40 ms to sort and 35 ms to submit through raylib's immediate mode, roughly 10 FPS. The next steps for
+speed are a counting/radix sort (see the note at STEP 7) and moving projection into a vertex shader. Compressed
+formats (`.spz`, compressed `.ply`) are not supported.

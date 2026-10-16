@@ -39,11 +39,19 @@ only need `raylib`.
 7. **Sort** back to front with a 16-bit counting sort.
 8. **Draw** one quad per splat; the fragment shader evaluates `opacity · exp(-½|uv|²)` and alpha blending composites.
 
-## Example scenes (not included)
+## Example scenes (not included, CMake can download them)
 
-- `nike.splat`, `plush.splat`: https://huggingface.co/cakewalk/splat-data (no license stated for these files).
-- `train`: `FO_dataset/train/point_cloud/iteration_7000/point_cloud.ply` from
-  https://huggingface.co/datasets/Voxel51/gaussian_splatting (184 MB, full 3DGS `.ply` with SH degree 3).
+    cmake -S . -B build -DSPLAT_VIEWER_EXAMPLES=ON    # ~200 MB into examples/, checked by SHA-256
+    ./build/splat_viewer examples/train/train.ply
+
+Files already in `examples/` are skipped, so re-running configure does not download them again.
+
+- `nike/nike.splat` (9 MB), `plush/plush.splat` (9 MB): https://huggingface.co/cakewalk/splat-data. No license is
+  stated for these files, so they are for local learning only.
+- `train/train.ply` (184 MB, full 3DGS `.ply` with SH degree 3):
+  `FO_dataset/train/point_cloud/iteration_7000/point_cloud.ply` from
+  https://huggingface.co/datasets/Voxel51/gaussian_splatting (dataset card: Apache-2.0). The scene comes from
+  Tanks and Temples and was trained with Inria's gaussian-splatting code, which have their own terms.
 
 ## Limits
 

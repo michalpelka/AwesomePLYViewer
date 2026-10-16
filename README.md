@@ -1,19 +1,22 @@
-# Gaussian splat viewer (raylib)
+# Gaussian splat viewer (raylib), GPU version
 
 A minimal 3D Gaussian Splatting viewer: one C++ file, commented step by step (STEP 1–9 in `splat_viewer.cpp`).
 STEPs 1–8 run the whole render pipeline on the CPU, so it can be read and stepped through in a debugger. STEP 9
 moves the per-splat work into a vertex shader; it is the default renderer, and `G` switches back to the CPU path.
 
+This is the faster version of the CPU-only viewer at https://gist.github.com/michalpelka/fc7d1595f439192277ad04d7be1a248a,
+which is the shorter read if you only want to learn the pipeline.
+
 ## Get the code
 
 The code lives in a GitHub gist, which is a small git repository, so it clones like any other (no GitHub login needed):
 
-    git clone https://gist.github.com/fc7d1595f439192277ad04d7be1a248a.git splat_viewer
-    cd splat_viewer
+    git clone https://gist.github.com/90d61e34e235524e20deec411371bc9e.git splat_viewer_gpu
+    cd splat_viewer_gpu
 
-Or with the GitHub CLI: `gh gist clone fc7d1595f439192277ad04d7be1a248a splat_viewer`.
+Or with the GitHub CLI: `gh gist clone 90d61e34e235524e20deec411371bc9e splat_viewer_gpu`.
 
-A gist cannot contain folders, so all files sit at the top level. Run the commands below from inside `splat_viewer/`.
+A gist cannot contain folders, so all files sit at the top level. Run the commands below from inside `splat_viewer_gpu/`.
 `git pull` there picks up later updates to the gist.
 
 ## Build

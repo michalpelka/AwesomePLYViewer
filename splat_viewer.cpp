@@ -12,7 +12,7 @@
 //    STEP 5  Project every splat to the screen       Σ' = J W Σ Wᵀ Jᵀ
 //    STEP 5b Color for this view: spherical harmonics (H turns them off)
 //    STEP 6  Turn the 2D covariance into an ellipse  (eigen-decomposition)
-//    STEP 7  Sort back to front                      (counting sort on depth)
+//    STEP 7  Sort back to front                      (std::sort on depth)
 //    STEP 8  Draw one quad per splat, the fragment shader evaluates the
 //            Gaussian and alpha blending composites them
 //
@@ -517,38 +517,16 @@ static Color EvalSphericalHarmonics(const Vector3 *coeffs, int degree, Vector3 d
 // front to back. Back to front with ordinary alpha blending gives the same
 // image and is what the GPU's blend unit does natively.
 //
-// A counting sort is used instead of std::sort because it is O(N) and stays
-// fast for millions of splats. Depth is quantized to 16 bits (65536 buckets);
-// splats in the same bucket keep their original relative order.
+// NOTE: std::sort is the simplest way to write this, not the fastest. It is
+// O(N log N), and every comparison fetches a depth from a random place in
+// memory: about 40 ms for the 580k visible splats of the train scene.
+// Real-time viewers instead quantize depth to 16 bits and use an O(N)
+// counting/radix sort (about 4 ms for the same scene), or sort on the GPU.
 // ----------------------------------------------------------------------------
-#define SORT_BUCKETS 65536
-
-static void SortBackToFront(const ProjectedSplat *proj, const int *visible, int visibleCount,
-                            int *sorted, uint16_t *keys, unsigned int *bucketStart)
+static void SortBackToFront(const ProjectedSplat *proj, const int *visible, int visibleCount, int *sorted)
 {
-    if (visibleCount == 0) return;
-
-    float minDepth = INFINITY, maxDepth = -INFINITY;
-    for (int i = 0; i < visibleCount; i++) {
-        float d = proj[visible[i]].depth;
-        minDepth = fminf(minDepth, d);
-        maxDepth = fmaxf(maxDepth, d);
-    }
-    float range = fmaxf(maxDepth - minDepth, 1e-6f);
-
-    // key 0 = farthest, key 65535 = nearest, so ascending key = back to front
-    memset(bucketStart, 0, sizeof(unsigned int)*SORT_BUCKETS);
-    for (int i = 0; i < visibleCount; i++) {
-        keys[i] = (uint16_t)((maxDepth - proj[visible[i]].depth)/range*(SORT_BUCKETS - 1));
-        bucketStart[keys[i]]++;                               // 1) count per bucket
-    }
-    unsigned int sum = 0;
-    for (int k = 0; k < SORT_BUCKETS; k++) {                  // 2) prefix sum -> where each bucket starts
-        unsigned int c = bucketStart[k];
-        bucketStart[k] = sum;
-        sum += c;
-    }
-    for (int i = 0; i < visibleCount; i++) sorted[bucketStart[keys[i]]++] = visible[i];  // 3) scatter
+    std::copy(visible, visible + visibleCount, sorted);
+    std::sort(sorted, sorted + visibleCount, [&](int a, int b) { return proj[a].depth > proj[b].depth; });
 }
 
 // ----------------------------------------------------------------------------
@@ -674,8 +652,6 @@ int main(int argc, char **argv)
     // Per-frame working memory, allocated once.
     std::vector<ProjectedSplat> proj(count);
     std::vector<int> visible(count), sorted(count);
-    std::vector<uint16_t> keys(count);
-    std::vector<unsigned int> buckets(SORT_BUCKETS);
 
     Shader shader = LoadShaderFromMemory(NULL, SPLAT_FS);
     int modeLoc = GetShaderLocation(shader, "mode");
@@ -732,7 +708,7 @@ int main(int argc, char **argv)
         double t1 = GetTime();
         const int *order = visible.data();  // unsorted = file order
         if (sortEnabled) {
-            SortBackToFront(proj.data(), visible.data(), visibleCount, sorted.data(), keys.data(), buckets.data());
+            SortBackToFront(proj.data(), visible.data(), visibleCount, sorted.data());
             order = sorted.data();
         }
 

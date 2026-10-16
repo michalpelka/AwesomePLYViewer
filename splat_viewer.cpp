@@ -12,9 +12,11 @@
 //    STEP 5  Project every splat to the screen       Σ' = J W Σ Wᵀ Jᵀ
 //    STEP 5b Color for this view: spherical harmonics (H turns them off)
 //    STEP 6  Turn the 2D covariance into an ellipse  (eigen-decomposition)
-//    STEP 7  Sort back to front                      (std::sort on depth)
+//    STEP 7  Sort back to front                      (counting sort on depth)
 //    STEP 8  Draw one quad per splat, the fragment shader evaluates the
 //            Gaussian and alpha blending composites them
+//    STEP 9  The same on the GPU: splats uploaded once, the vertex shader
+//            runs STEPs 5, 5b and 6 (default renderer; G switches to the CPU)
 //
 //  Usage:  ./splat_viewer              -> procedural demo scene
 //          ./splat_viewer scene.ply    -> standard 3DGS output .ply (read with happly)
@@ -382,19 +384,27 @@ static ViewParams MakeView(const OrbitCamera *cam, int width, int height)
 //   eigenvectors = ellipse axis directions, sqrt(eigenvalues) = 1 sigma radii.
 // Returns false if the splat is not visible.
 // ----------------------------------------------------------------------------
-static bool ProjectSplat(const Splat *s, const ViewParams *v, float scaleMod, ProjectedSplat *out)
+// Camera-space position of a splat center (a dot product with each camera
+// axis), and whether the splat is worth drawing. Shared by both renderers.
+static bool ToCameraSpace(Vector3 p, const ViewParams *v, float *tx, float *ty, float *tz)
 {
-    // --- camera-space position: dot with each basis vector ---
-    Vector3 d = Vector3Subtract(s->position, v->eye);
-    float tx = Vector3DotProduct(d, v->right);
-    float ty = Vector3DotProduct(d, v->up);
-    float tz = Vector3DotProduct(d, v->forward);
-    if (tz < 0.2f) return false;  // behind the camera or too close (near plane)
+    Vector3 d = Vector3Subtract(p, v->eye);
+    *tx = Vector3DotProduct(d, v->right);
+    *ty = Vector3DotProduct(d, v->up);
+    *tz = Vector3DotProduct(d, v->forward);
+    if (*tz < 0.2f) return false;  // behind the camera or too close (near plane)
 
     // Skip splats whose center is far outside the view. 1.3x the screen gives
     // big splats just off screen a chance to still poke in.
     float limX = 1.3f*v->tanHalfFovX, limY = 1.3f*v->tanHalfFovY;
-    if (fabsf(tx/tz) > limX || fabsf(ty/tz) > limY) return false;
+    return fabsf(*tx / *tz) <= limX && fabsf(*ty / *tz) <= limY;
+}
+
+static bool ProjectSplat(const Splat *s, const ViewParams *v, float scaleMod, ProjectedSplat *out)
+{
+    // --- camera-space position, cull ---
+    float tx, ty, tz;
+    if (!ToCameraSpace(s->position, v, &tx, &ty, &tz)) return false;
 
     // --- W: world -> camera rotation (rows are the camera axes) ---
     float W[3][3] = {
@@ -517,16 +527,42 @@ static Color EvalSphericalHarmonics(const Vector3 *coeffs, int degree, Vector3 d
 // front to back. Back to front with ordinary alpha blending gives the same
 // image and is what the GPU's blend unit does natively.
 //
-// NOTE: std::sort is the simplest way to write this, not the fastest. It is
-// O(N log N), and every comparison fetches a depth from a random place in
+// std::sort would be the simplest (the main branch uses it), but it is
+// O(N log N) and every comparison fetches a depth from a random place in
 // memory: about 40 ms for the 580k visible splats of the train scene.
-// Real-time viewers instead quantize depth to 16 bits and use an O(N)
-// counting/radix sort (about 4 ms for the same scene), or sort on the GPU.
+// This branch uses a counting sort instead, about 4 ms for the same scene:
+// depth is quantized to 16 bits (65536 buckets), then three linear passes
+// put every splat in place. Splats in the same bucket keep their file order,
+// which is invisible on screen.
 // ----------------------------------------------------------------------------
-static void SortBackToFront(const ProjectedSplat *proj, const int *visible, int visibleCount, int *sorted)
+#define SORT_BUCKETS 65536
+
+static void SortBackToFront(const ProjectedSplat *proj, const int *visible, int visibleCount,
+                            int *sorted, uint16_t *keys, unsigned int *bucketStart)
 {
-    std::copy(visible, visible + visibleCount, sorted);
-    std::sort(sorted, sorted + visibleCount, [&](int a, int b) { return proj[a].depth > proj[b].depth; });
+    if (visibleCount == 0) return;
+
+    float minDepth = INFINITY, maxDepth = -INFINITY;
+    for (int i = 0; i < visibleCount; i++) {
+        float d = proj[visible[i]].depth;
+        minDepth = fminf(minDepth, d);
+        maxDepth = fmaxf(maxDepth, d);
+    }
+    float range = fmaxf(maxDepth - minDepth, 1e-6f);
+
+    // key 0 = farthest, key 65535 = nearest, so ascending key = back to front
+    memset(bucketStart, 0, sizeof(unsigned int)*SORT_BUCKETS);
+    for (int i = 0; i < visibleCount; i++) {
+        keys[i] = (uint16_t)((maxDepth - proj[visible[i]].depth)/range*(SORT_BUCKETS - 1));
+        bucketStart[keys[i]]++;                               // 1) count per bucket
+    }
+    unsigned int sum = 0;
+    for (int k = 0; k < SORT_BUCKETS; k++) {                  // 2) prefix sum -> where each bucket starts
+        unsigned int c = bucketStart[k];
+        bucketStart[k] = sum;
+        sum += c;
+    }
+    for (int i = 0; i < visibleCount; i++) sorted[bucketStart[keys[i]]++] = visible[i];  // 3) scatter
 }
 
 // ----------------------------------------------------------------------------
@@ -600,6 +636,246 @@ static void DrawSplats(const ProjectedSplat *proj, const int *order, int count,
 }
 
 // ----------------------------------------------------------------------------
+// STEP 9: The same pipeline on the GPU (default renderer; G switches)
+//
+// The CPU renderer above runs STEPs 5, 5b and 6 for every splat on the CPU
+// and sends 4 vertices (144 bytes) per splat to the GPU every frame, through
+// ~12M raylib function calls. The GPU renderer instead:
+//   - uploads all splat data ONCE, packed in a float texture, texelsPerSplat
+//     RGBA32F texels per splat:
+//         texel 0     position xyz, opacity
+//         texel 1, 2  3D covariance Σ: xx xy xz yy | yz zz
+//         texel 3...  SH coefficients, one RGB triple per texel (f_dc first)
+//   - per frame lets the CPU only cull, sort, and upload the draw order: one
+//     float per visible splat (its index), 4 bytes instead of 144
+//   - draws everything with ONE instanced draw call: the same 6-vertex quad,
+//     once per splat. The vertex shader reads "its" splat from the texture
+//     and runs STEPs 5, 5b and 6 itself. The fragment shader is unchanged.
+// ----------------------------------------------------------------------------
+static const char *SPLAT_VS = R"(#version 330
+layout(location = 0) in vec2 corner;       // quad corner (+-1, +-1), the same 6 for every splat
+layout(location = 1) in float splatIndex;  // per instance: which splat to draw (in sorted order)
+
+uniform sampler2D splatData;               // the packed splat texture described above
+uniform int texelsPerSplat;
+uniform int splatsPerRow;
+uniform vec3 eye, camRight, camUp, camForward;
+uniform float focal;
+uniform vec2 screenSize;
+uniform float scaleMod;
+uniform int shDegree;                      // 0 = base color only
+uniform mat4 toFileFrame;                  // world direction -> frame the SH were trained in
+uniform int mode;                          // 0 gaussian, 1 ellipse outline, 2 solid dot
+
+out vec2 fragTexCoord;                     // same outputs as raylib's default vertex shader,
+out vec4 fragColor;                        // so the fragment shader is shared with the CPU path
+
+vec4 Fetch(int splat, int texel)
+{
+    ivec2 xy = ivec2((splat % splatsPerRow)*texelsPerSplat + texel, splat/splatsPerRow);
+    return texelFetch(splatData, xy, 0);
+}
+
+// STEP 5b: the same basis functions as EvalSphericalHarmonics()
+vec3 EvalSH(int s, vec3 dir)
+{
+    float x = dir.x, y = dir.y, z = dir.z;
+    float xx = x*x, yy = y*y, zz = z*z;
+    float Y[16];
+    Y[0] = 0.28209479177387814;
+    if (shDegree >= 1) {
+        Y[1] = -0.4886025119029199*y;  Y[2] = 0.4886025119029199*z;  Y[3] = -0.4886025119029199*x;
+    }
+    if (shDegree >= 2) {
+        Y[4] = 1.0925484305920792*x*y;   Y[5] = -1.0925484305920792*y*z;
+        Y[6] = 0.31539156525252005*(2.0*zz - xx - yy);
+        Y[7] = -1.0925484305920792*x*z;  Y[8] = 0.5462742152960396*(xx - yy);
+    }
+    if (shDegree >= 3) {
+        Y[9]  = -0.5900435899266435*y*(3.0*xx - yy);       Y[10] = 2.890611442640554*x*y*z;
+        Y[11] = -0.4570457994644658*y*(4.0*zz - xx - yy);  Y[12] = 0.3731763325901154*z*(2.0*zz - 3.0*xx - 3.0*yy);
+        Y[13] = -0.4570457994644658*x*(4.0*zz - xx - yy);  Y[14] = 1.445305721320277*z*(xx - yy);
+        Y[15] = -0.5900435899266435*x*(xx - 3.0*yy);
+    }
+    vec3 rgb = vec3(0.5);
+    int n = (shDegree + 1)*(shDegree + 1);
+    for (int k = 0; k < n; k++) rgb += Fetch(s, 3 + k).rgb*Y[k];
+    return clamp(rgb, 0.0, 1.0);
+}
+
+void main()
+{
+    int s = int(splatIndex);
+    vec4 t0 = Fetch(s, 0), t1 = Fetch(s, 1), t2 = Fetch(s, 2);
+
+    // STEP 5: camera space, T = J W written out row by row, Sigma' = T Sigma T^T
+    vec3 d = t0.xyz - eye;
+    float tx = dot(d, camRight), ty = dot(d, camUp), tz = dot(d, camForward);
+    vec3 T0 = (focal/tz)*camRight - (focal*tx/(tz*tz))*camForward;
+    vec3 T1 = -(focal/tz)*camUp + (focal*ty/(tz*tz))*camForward;
+    mat3 Sigma = mat3(t1.x, t1.y, t1.z,
+                      t1.y, t1.w, t2.x,
+                      t1.z, t2.x, t2.y)*(scaleMod*scaleMod);
+    float a = dot(T0, Sigma*T0) + 0.3;  // + the same low-pass filter as on the CPU
+    float b = dot(T0, Sigma*T1);
+    float e = dot(T1, Sigma*T1) + 0.3;
+
+    // STEP 6: ellipse axes from the eigen-decomposition, rectangle at +-3 sigma
+    float mid = 0.5*(a + e);
+    float radius = sqrt(0.25*(a - e)*(a - e) + b*b);
+    float lambda1 = mid + radius;
+    float lambda2 = max(mid - radius, 0.1);
+    vec2 dir1 = (abs(b) > 1e-6) ? normalize(vec2(b, lambda1 - a)) : ((a >= e) ? vec2(1.0, 0.0) : vec2(0.0, 1.0));
+    vec2 dir2 = vec2(-dir1.y, dir1.x);
+    vec2 a1 = 3.0*dir1*min(sqrt(lambda1), 1024.0);
+    vec2 a2 = 3.0*dir2*min(sqrt(lambda2), 1024.0);
+
+    // STEP 5b: color seen from this camera
+    vec4 color = vec4(EvalSH(s, mat3(toFileFrame)*normalize(d)), t0.w);
+    if (mode == 2) { a1 = vec2(2.5, 0.0); a2 = vec2(0.0, 2.5); color.a = 1.0; }
+
+    vec2 center = vec2(0.5*screenSize.x + focal*tx/tz, 0.5*screenSize.y - focal*ty/tz);
+    vec2 pixel = center + corner.x*a1 + corner.y*a2;
+    fragTexCoord = 3.0*corner;
+    fragColor = color;
+    // pixels -> clip space; y flips because pixel rows go down and clip y goes up
+    gl_Position = vec4(2.0*pixel.x/screenSize.x - 1.0, 1.0 - 2.0*pixel.y/screenSize.y, 0.0, 1.0);
+}
+)";
+
+struct GpuRenderer {
+    Shader shader = {};
+    unsigned int dataTexture = 0;
+    int texelsPerSplat = 0, splatsPerRow = 0, width = 0, height = 0;
+    unsigned int vao = 0, cornerVbo = 0, orderVbo = 0;
+    std::vector<float> order;  // per-frame draw order, as floats for the vertex attribute
+    int locEye, locRight, locUp, locForward, locFocal, locScreen, locScale, locShDegree, locToFile, locMode;
+};
+
+// Pack every splat into its block of texels (see the layout above).
+static std::vector<float> PackSplatTexels(const std::vector<Splat> &splats, const SphericalHarmonics &sh,
+                                          const GpuRenderer &g)
+{
+    const float SH_C0 = 0.28209479177387814f;
+    std::vector<float> texels((size_t)g.width*g.height*4, 0.0f);
+    for (size_t i = 0; i < splats.size(); i++) {
+        const Splat &s = splats[i];
+        size_t firstTexel = (i/g.splatsPerRow)*g.width + (i % g.splatsPerRow)*g.texelsPerSplat;
+        float *t = &texels[firstTexel*4];
+        t[0] = s.position.x; t[1] = s.position.y; t[2] = s.position.z; t[3] = s.color.a/255.0f;
+        memcpy(t + 4, s.cov, sizeof(s.cov));  // texels 1 and 2 (the last 2 floats stay 0)
+        if (sh.degree > 0) {
+            for (int k = 0; k < sh.perSplat; k++) {
+                Vector3 c = sh.coeffs[i*sh.perSplat + k];
+                t[12 + 4*k] = c.x; t[13 + 4*k] = c.y; t[14 + 4*k] = c.z;
+            }
+        } else {
+            // No SH in the file: store the base color as coefficient 0 (color = 0.5 + C0*c0).
+            t[12] = (s.color.r/255.0f - 0.5f)/SH_C0;
+            t[13] = (s.color.g/255.0f - 0.5f)/SH_C0;
+            t[14] = (s.color.b/255.0f - 0.5f)/SH_C0;
+        }
+    }
+    return texels;
+}
+
+static bool LoadGpuRenderer(GpuRenderer *g, const std::vector<Splat> &splats, const SphericalHarmonics &sh)
+{
+    const int maxTextureSize = 16384;  // supported by every desktop GPU of the last decade
+    g->texelsPerSplat = 3 + sh.perSplat;
+    g->splatsPerRow = maxTextureSize/g->texelsPerSplat;
+    g->width = g->splatsPerRow*g->texelsPerSplat;
+    g->height = (int)((splats.size() + g->splatsPerRow - 1)/g->splatsPerRow);
+    if (g->height > maxTextureSize) {
+        TraceLog(LOG_WARNING, "Too many splats for one GPU texture, using the CPU renderer");
+        return false;
+    }
+    std::vector<float> texels = PackSplatTexels(splats, sh, *g);
+    g->dataTexture = rlLoadTexture(texels.data(), g->width, g->height, RL_PIXELFORMAT_UNCOMPRESSED_R32G32B32A32, 1);
+
+    g->shader = LoadShaderFromMemory(SPLAT_VS, SPLAT_FS);
+    int unit = 1;  // the splat texture is bound to texture unit 1, raylib uses unit 0
+    SetShaderValue(g->shader, GetShaderLocation(g->shader, "splatData"), &unit, SHADER_UNIFORM_INT);
+    SetShaderValue(g->shader, GetShaderLocation(g->shader, "texelsPerSplat"), &g->texelsPerSplat, SHADER_UNIFORM_INT);
+    SetShaderValue(g->shader, GetShaderLocation(g->shader, "splatsPerRow"), &g->splatsPerRow, SHADER_UNIFORM_INT);
+    g->locEye = GetShaderLocation(g->shader, "eye");
+    g->locRight = GetShaderLocation(g->shader, "camRight");
+    g->locUp = GetShaderLocation(g->shader, "camUp");
+    g->locForward = GetShaderLocation(g->shader, "camForward");
+    g->locFocal = GetShaderLocation(g->shader, "focal");
+    g->locScreen = GetShaderLocation(g->shader, "screenSize");
+    g->locScale = GetShaderLocation(g->shader, "scaleMod");
+    g->locShDegree = GetShaderLocation(g->shader, "shDegree");
+    g->locToFile = GetShaderLocation(g->shader, "toFileFrame");
+    g->locMode = GetShaderLocation(g->shader, "mode");
+
+    // Vertex array: attribute 0 = the 6 quad corners, shared by every instance;
+    // attribute 1 = the splat index, advancing once per instance (divisor 1).
+    static const float corners[12] = { -1, -1,  -1, 1,  1, 1,    -1, -1,  1, 1,  1, -1 };  // CCW on screen
+    g->vao = rlLoadVertexArray();
+    rlEnableVertexArray(g->vao);
+    g->cornerVbo = rlLoadVertexBuffer(corners, sizeof(corners), false);
+    rlSetVertexAttribute(0, 2, RL_FLOAT, false, 0, 0);
+    rlEnableVertexAttribute(0);
+    g->order.resize(splats.size());
+    g->orderVbo = rlLoadVertexBuffer(NULL, (int)(splats.size()*sizeof(float)), true);
+    rlSetVertexAttribute(1, 1, RL_FLOAT, false, 0, 0);
+    rlSetVertexAttributeDivisor(1, 1);
+    rlEnableVertexAttribute(1);
+    rlDisableVertexArray();
+    return true;
+}
+
+// Splats changed on the CPU (the F flip): send the new data to the GPU copy.
+static void UpdateGpuSplatData(GpuRenderer *g, const std::vector<Splat> &splats, const SphericalHarmonics &sh)
+{
+    std::vector<float> texels = PackSplatTexels(splats, sh, *g);
+    rlUpdateTexture(g->dataTexture, 0, 0, g->width, g->height, RL_PIXELFORMAT_UNCOMPRESSED_R32G32B32A32, texels.data());
+}
+
+static void DrawSplatsGpu(GpuRenderer *g, const int *order, int count, const ViewParams *v, Vector2 screen,
+                          float scaleMod, int shDegree, Quaternion toFileFrame, ViewMode mode)
+{
+    if (count == 0) return;
+
+    // The draw order: one float per instance (exact for indices below 2^24).
+    for (int i = 0; i < count; i++) g->order[i] = (float)order[i];
+    rlUpdateVertexBuffer(g->orderVbo, g->order.data(), count*(int)sizeof(float), 0);
+
+    int shaderMode = (mode == VIEW_GAUSSIANS) ? 0 : (mode == VIEW_ELLIPSES) ? 1 : 2;
+    SetShaderValue(g->shader, g->locEye, &v->eye, SHADER_UNIFORM_VEC3);
+    SetShaderValue(g->shader, g->locRight, &v->right, SHADER_UNIFORM_VEC3);
+    SetShaderValue(g->shader, g->locUp, &v->up, SHADER_UNIFORM_VEC3);
+    SetShaderValue(g->shader, g->locForward, &v->forward, SHADER_UNIFORM_VEC3);
+    SetShaderValue(g->shader, g->locFocal, &v->focal, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(g->shader, g->locScreen, &screen, SHADER_UNIFORM_VEC2);
+    SetShaderValue(g->shader, g->locScale, &scaleMod, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(g->shader, g->locShDegree, &shDegree, SHADER_UNIFORM_INT);
+    SetShaderValue(g->shader, g->locMode, &shaderMode, SHADER_UNIFORM_INT);
+    SetShaderValueMatrix(g->shader, g->locToFile, QuaternionToMatrix(toFileFrame));
+
+    rlDrawRenderBatchActive();  // draw anything raylib queued before us first
+    rlEnableShader(g->shader.id);
+    rlActiveTextureSlot(1);
+    rlEnableTexture(g->dataTexture);
+    rlEnableVertexArray(g->vao);
+    rlDrawVertexArrayInstanced(0, 6, count);
+    rlDisableVertexArray();
+    rlDisableTexture();
+    rlActiveTextureSlot(0);
+    rlDisableShader();
+}
+
+static void UnloadGpuRenderer(GpuRenderer *g)
+{
+    rlUnloadVertexArray(g->vao);
+    rlUnloadVertexBuffer(g->cornerVbo);
+    rlUnloadVertexBuffer(g->orderVbo);
+    rlUnloadTexture(g->dataTexture);
+    UnloadShader(g->shader);
+}
+
+// ----------------------------------------------------------------------------
 // Helpers to aim the camera at a loaded scene: the median is robust to the
 // far-away background splats that real captures always contain.
 // ----------------------------------------------------------------------------
@@ -652,9 +928,16 @@ int main(int argc, char **argv)
     // Per-frame working memory, allocated once.
     std::vector<ProjectedSplat> proj(count);
     std::vector<int> visible(count), sorted(count);
+    std::vector<uint16_t> keys(count);
+    std::vector<unsigned int> buckets(SORT_BUCKETS);
 
     Shader shader = LoadShaderFromMemory(NULL, SPLAT_FS);
     int modeLoc = GetShaderLocation(shader, "mode");
+
+    // STEP 9: copy the splats to the GPU once
+    GpuRenderer gpu;
+    bool gpuReady = LoadGpuRenderer(&gpu, splats, sh);
+    bool useGpu = gpuReady;
 
     ViewMode mode = VIEW_GAUSSIANS;
     bool sortEnabled = true;
@@ -683,7 +966,12 @@ int main(int argc, char **argv)
         if (IsKeyPressed(KEY_H) && sh.degree > 0) shEnabled = !shEnabled;
         if (IsKeyDown(KEY_EQUAL) || IsKeyDown(KEY_KP_ADD)) scaleMod = fminf(scaleMod*1.02f, 4.0f);
         if (IsKeyDown(KEY_MINUS) || IsKeyDown(KEY_KP_SUBTRACT)) scaleMod = fmaxf(scaleMod/1.02f, 0.01f);
-        if (IsKeyPressed(KEY_F)) { FlipSceneUpsideDown(splats); flipped = !flipped; }
+        if (IsKeyPressed(KEY_G) && gpuReady) useGpu = !useGpu;
+        if (IsKeyPressed(KEY_F)) {
+            FlipSceneUpsideDown(splats);
+            flipped = !flipped;
+            if (gpuReady) UpdateGpuSplatData(&gpu, splats, sh);  // keep the GPU copy in sync
+        }
         if (IsKeyPressed(KEY_R)) { cam = initialCam; scaleMod = 1.0f; }
         view = MakeView(&cam, GetScreenWidth(), GetScreenHeight());
 
@@ -693,22 +981,33 @@ int main(int argc, char **argv)
         Quaternion toFileFrame = flipped ? QuaternionInvert(SceneFlip()) : QuaternionIdentity();
         double t0 = GetTime();
         int visibleCount = 0;
-        for (int i = 0; i < count; i++) {
-            if (!ProjectSplat(&splats[i], &view, scaleMod, &proj[i])) continue;
-            proj[i].color = splats[i].color;
-            if (shEnabled) {
-                Vector3 dir = Vector3Normalize(Vector3Subtract(splats[i].position, view.eye));
-                dir = Vector3RotateByQuaternion(dir, toFileFrame);
-                proj[i].color = EvalSphericalHarmonics(&sh.coeffs[(size_t)i*sh.perSplat], sh.degree, dir, splats[i].color.a);
+        if (useGpu) {
+            // GPU renderer: the CPU only culls and records the depth for the sort.
+            // Projection, color and corners happen in the vertex shader (STEP 9).
+            for (int i = 0; i < count; i++) {
+                float tx, ty, tz;
+                if (!ToCameraSpace(splats[i].position, &view, &tx, &ty, &tz)) continue;
+                proj[i].depth = tz;
+                visible[visibleCount++] = i;
             }
-            visible[visibleCount++] = i;
+        } else {
+            for (int i = 0; i < count; i++) {
+                if (!ProjectSplat(&splats[i], &view, scaleMod, &proj[i])) continue;
+                proj[i].color = splats[i].color;
+                if (shEnabled) {
+                    Vector3 dir = Vector3Normalize(Vector3Subtract(splats[i].position, view.eye));
+                    dir = Vector3RotateByQuaternion(dir, toFileFrame);
+                    proj[i].color = EvalSphericalHarmonics(&sh.coeffs[(size_t)i*sh.perSplat], sh.degree, dir, splats[i].color.a);
+                }
+                visible[visibleCount++] = i;
+            }
         }
 
         // ---- STEP 7: sort ----
         double t1 = GetTime();
         const int *order = visible.data();  // unsorted = file order
         if (sortEnabled) {
-            SortBackToFront(proj.data(), visible.data(), visibleCount, sorted.data());
+            SortBackToFront(proj.data(), visible.data(), visibleCount, sorted.data(), keys.data(), buckets.data());
             order = sorted.data();
         }
 
@@ -716,30 +1015,39 @@ int main(int argc, char **argv)
         double t2 = GetTime();
         BeginDrawing();
         ClearBackground(Color{ 20, 20, 26, 255 });
-        DrawSplats(proj.data(), order, visibleCount, mode, shader, modeLoc);
+        if (useGpu) {
+            Vector2 screen = { (float)GetScreenWidth(), (float)GetScreenHeight() };
+            DrawSplatsGpu(&gpu, order, visibleCount, &view, screen, scaleMod, shEnabled ? sh.degree : 0, toFileFrame, mode);
+        } else {
+            DrawSplats(proj.data(), order, visibleCount, mode, shader, modeLoc);
+        }
         double t3 = GetTime();
 
         // ---- HUD ----
         static const char *modeNames[] = { "Gaussians", "Ellipses (2 sigma)", "Centers" };
-        DrawRectangle(8, 8, 380, 242, Fade(BLACK, 0.6f));
+        DrawRectangle(8, 8, 380, 262, Fade(BLACK, 0.6f));
         DrawText(TextFormat("%d FPS   %d / %d splats visible", GetFPS(), visibleCount, count), 16, 16, 18, RAYWHITE);
-        DrawText(TextFormat("project %.1f ms  sort %.1f ms  draw %.1f ms",
+        DrawText(TextFormat(useGpu ? "cull %.1f ms  sort %.1f ms  upload+draw %.1f ms" : "project %.1f ms  sort %.1f ms  draw %.1f ms",
                             (t1 - t0)*1000.0, (t2 - t1)*1000.0, (t3 - t2)*1000.0), 16, 38, 16, LIGHTGRAY);
-        DrawText(TextFormat("[1/2/3] view:   %s", modeNames[mode]), 16, 66, 16, RAYWHITE);
-        DrawText(TextFormat("[S] sort:       %s", sortEnabled ? "on (back to front)" : "OFF (file order)"), 16, 86, 16,
+        DrawText(!gpuReady ? "[G] renderer:   CPU (GPU unavailable)"
+                 : useGpu  ? "[G] renderer:   GPU (vertex shader)"
+                           : "[G] renderer:   CPU (reference)", 16, 66, 16, (gpuReady && !useGpu) ? ORANGE : RAYWHITE);
+        DrawText(TextFormat("[1/2/3] view:   %s", modeNames[mode]), 16, 86, 16, RAYWHITE);
+        DrawText(TextFormat("[S] sort:       %s", sortEnabled ? "on (back to front)" : "OFF (file order)"), 16, 106, 16,
                  sortEnabled ? RAYWHITE : ORANGE);
         DrawText((sh.degree == 0) ? "[H] SH color:   none in file"
                  : shEnabled      ? TextFormat("[H] SH color:   on (degree %d)", sh.degree)
-                                  : "[H] SH color:   OFF (base color)", 16, 106, 16,
+                                  : "[H] SH color:   OFF (base color)", 16, 126, 16,
                  (sh.degree > 0 && !shEnabled) ? ORANGE : RAYWHITE);
-        DrawText(TextFormat("[+/-] scale:    %.2fx", scaleMod), 16, 126, 16, RAYWHITE);
-        DrawText(TextFormat("[F] flip Y:     %s", flipped ? "on" : "off"), 16, 146, 16, RAYWHITE);
-        DrawText("[R] reset camera", 16, 166, 16, RAYWHITE);
-        DrawText("LMB orbit  RMB/MMB pan  wheel zoom", 16, 194, 16, LIGHTGRAY);
-        DrawText("F12 screenshot  Esc quit", 16, 214, 16, LIGHTGRAY);
+        DrawText(TextFormat("[+/-] scale:    %.2fx", scaleMod), 16, 146, 16, RAYWHITE);
+        DrawText(TextFormat("[F] flip Y:     %s", flipped ? "on" : "off"), 16, 166, 16, RAYWHITE);
+        DrawText("[R] reset camera", 16, 186, 16, RAYWHITE);
+        DrawText("LMB orbit  RMB/MMB pan  wheel zoom", 16, 214, 16, LIGHTGRAY);
+        DrawText("F12 screenshot  Esc quit", 16, 234, 16, LIGHTGRAY);
         EndDrawing();
     }
 
+    if (gpuReady) UnloadGpuRenderer(&gpu);
     UnloadShader(shader);
     CloseWindow();
     return 0;

@@ -1,7 +1,8 @@
 # Gaussian splat viewer (raylib)
 
-A minimal 3D Gaussian Splatting viewer: one C++ file that runs the whole render pipeline on the CPU,
-commented step by step (STEP 1–8 in `splat_viewer.cpp`). It is written to be read, not to be fast.
+A minimal 3D Gaussian Splatting viewer: one C++ file, commented step by step (STEP 1–9 in `splat_viewer.cpp`).
+STEPs 1–8 run the whole render pipeline on the CPU, so it can be read and stepped through in a debugger. STEP 9
+moves the per-splat work into a vertex shader; it is the default renderer, and `G` switches back to the CPU path.
 
 ## Get the code
 
@@ -38,6 +39,7 @@ only need `raylib`.
 | `H` | spherical-harmonics (view-dependent) color on/off |
 | `+` `-` | shrink / grow every splat |
 | `F` | flip Y (COLMAP scenes are Y-down) |
+| `G` | renderer: GPU (default) / CPU reference |
 | `R` | reset camera |
 
 ## The pipeline, as laid out in the code
@@ -48,8 +50,10 @@ only need `raylib`.
 4. **Orbit camera**: right/up/forward basis and pinhole projection.
 5. **Project**: `Σ' = J W Σ Wᵀ Jᵀ` plus a 0.3 px² low-pass filter. **5b**: view-dependent color from SH degrees 0–3.
 6. **Ellipse**: eigen-decomposition of the 2×2 `Σ'` gives the axes and the 1-sigma radii.
-7. **Sort** back to front with `std::sort`. This is simple but not optimal: a 16-bit counting/radix sort is about 10× faster.
+7. **Sort** back to front with a 16-bit counting sort: about 4 ms for 580k splats, where `std::sort` takes about 40 ms.
 8. **Draw** one quad per splat; the fragment shader evaluates `opacity · exp(-½|uv|²)` and alpha blending composites.
+9. **GPU renderer**: all splat data is uploaded once into a float texture. Per frame the CPU only culls, sorts and
+   uploads the draw order (4 bytes per splat), and one instanced draw call runs steps 5, 5b and 6 in the vertex shader.
 
 ## Example scenes (not included, CMake can download them)
 
@@ -67,7 +71,7 @@ Files already in `examples/` are skipped, so re-running configure does not downl
 
 ## Limits
 
-Everything is on the CPU. On the train scene (580k visible splats) a frame takes about 25 ms to project and shade
-(with SH), 40 ms to sort and 35 ms to submit through raylib's immediate mode, roughly 10 FPS. The next steps for
-speed are a counting/radix sort (see the note at STEP 7) and moving projection into a vertex shader. Compressed
-formats (`.spz`, compressed `.ply`) are not supported.
+On the train scene (742k splats, 580k visible) the GPU renderer takes about 8.5 ms per frame: 4.4 ms to cull and
+3.6 ms to sort on the CPU, with the GPU work finishing within that time. The CPU reference path takes about 68 ms. What remains is
+CPU culling and sorting, single-threaded. The splat texture takes 304 bytes per splat in GPU memory (about 225 MB
+for the train scene). Compressed formats (`.spz`, compressed `.ply`) are not supported.

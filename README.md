@@ -3,6 +3,18 @@
 A minimal 3D Gaussian Splatting viewer: one C++ file that runs the whole render pipeline on the CPU,
 commented step by step (STEP 1–8 in `splat_viewer.cpp`). It is written to be read, not to be fast.
 
+## Get the code
+
+The code lives in a GitHub gist, which is a small git repository, so it clones like any other (no GitHub login needed):
+
+    git clone https://gist.github.com/fc7d1595f439192277ad04d7be1a248a.git splat_viewer
+    cd splat_viewer
+
+Or with the GitHub CLI: `gh gist clone fc7d1595f439192277ad04d7be1a248a splat_viewer`.
+
+A gist cannot contain folders, so all files sit at the top level. Run the commands below from inside `splat_viewer/`.
+`git pull` there picks up later updates to the gist.
+
 ## Build
 
 Needs raylib 5.5 and CMake ≥ 3.16. [happly](https://github.com/nmwsharp/happly) (PLY reader) is fetched by CMake.

@@ -16,6 +16,8 @@
 //            linearization
 //    STEP 6c View 4: ray cast and shade the 2-sigma ellipsoids inside it
 //    STEP 6d View 5: color each splat by how far off STEP 5's linearization is
+//    STEP 6e View 6: points with normal arrows (each splat's shortest axis)
+//    STEP 6f View 7: Gaussians evaluated per ray, without STEP 5's linearization
 //    STEP 7  Sort back to front                      (counting sort on depth)
 //    STEP 8  Draw one quad per splat, the fragment shader evaluates the
 //            Gaussian and alpha blending composites them
@@ -43,6 +45,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <string>
 #include <vector>
 
@@ -83,9 +86,13 @@ struct ProjectedSplat {
     Color color;     // color seen from this camera (STEP 5b), a = opacity
 };
 
-// Keys 1-5. The shaders get the same numbers (their uniform `mode`).
+// Keys 1-7. The shaders get the same numbers (their uniform `mode`); view 6 draws
+// twice, its points as view 3 (mode 2), then its arrows (mode 5).
 enum ViewMode { VIEW_GAUSSIANS = 0, VIEW_ELLIPSES, VIEW_CENTERS, VIEW_ELLIPSOIDS, VIEW_LINEARIZATION_ERROR,
-                VIEW_MODE_COUNT };
+                VIEW_NORMALS, VIEW_PER_RAY, VIEW_MODE_COUNT };
+static const char *viewNames[] = { "Gaussians", "Ellipses, linearized", "Centers", "Ellipsoids", "Linearization error",
+                                   "Points + normals", "Gaussians per ray" };
+static_assert(sizeof(viewNames)/sizeof(viewNames[0]) == VIEW_MODE_COUNT, "one name per view mode");
 
 // ----------------------------------------------------------------------------
 // STEP 2a: Load a .ply produced by 3D Gaussian Splatting training
@@ -716,14 +723,17 @@ static bool ProjectSplat(const Splat *s, const ViewParams *v, float scaleMod, Pr
 // not drawn. View 4 draws the ellipsoid in a rectangle around this outline,
 // so the rays that hit it are exactly the ones inside (STEP 6c). STEP 5's
 // low-pass filter is added here too: it makes that rectangle a little larger.
+// The 2 of "2 sigma" is k here: [ and ] set it (2 by default).
 // ----------------------------------------------------------------------------
-static bool ProjectSplatExact(const Splat *s, const ViewParams *v, float scaleMod, ProjectedSplat *out,
-                              float *cov2D = NULL)
+// extraVariance: added to Σ in every direction, world units² (view 7's 3D low-pass filter).
+static bool ProjectSplatExact(const Splat *s, const ViewParams *v, float scaleMod, float k, ProjectedSplat *out,
+                              float *cov2D = NULL, float extraVariance = 0.0f)
 {
-    // Σc = 2² W Σ Wᵀ (times the +/- scale squared), entry (i, j) = axis_i · Σ axis_j
+    // Σc = k² W Σ Wᵀ (times the +/- scale squared), entry (i, j) = axis_i · Σ axis_j
     const Vector3 axes[3] = { v->right, v->up, v->forward };  // the rows of W
-    const float *cv = s->cov;
-    float k2 = 4.0f*scaleMod*scaleMod;
+    float extra = extraVariance/(scaleMod*scaleMod);  // the scale multiplies it back
+    const float cv[6] = { s->cov[0] + extra, s->cov[1], s->cov[2], s->cov[3] + extra, s->cov[4], s->cov[5] + extra };
+    float k2 = k*k*scaleMod*scaleMod;
     float Sc[3][3];
     for (int j = 0; j < 3; j++) {
         Vector3 w = axes[j];
@@ -743,11 +753,11 @@ static bool ProjectSplatExact(const Splat *s, const ViewParams *v, float scaleMo
     float Sxy = (D*Sc[0][1] + szz*mx*my - tz*(mx*gy + gx*my) + gx*gy)/D2;
     float Syy = (D*Sc[1][1] + szz*my*my - 2.0f*tz*my*gy + gy*gy)/D2;
 
-    // To pixels (u = cx + f x, v = cy - f y, so xy flips sign), from 2 sigma
-    // back to 1 sigma (the ring is drawn at 2), plus the low-pass filter
-    float f = v->focal;
+    // To pixels (u = cx + f x, v = cy - f y, so xy flips sign), from k sigma
+    // back to 1 sigma (the ring is drawn at k), plus the low-pass filter
+    float f = v->focal, toSigma1 = f*f/(k*k);
     out->center = Vector2{ v->cx + f*centerX, v->cy - f*centerY };
-    float a = 0.25f*f*f*Sxx + 0.3f, b = -0.25f*f*f*Sxy, e = 0.25f*f*f*Syy + 0.3f;
+    float a = toSigma1*Sxx + 0.3f, b = -toSigma1*Sxy, e = toSigma1*Syy + 0.3f;
     EllipseAxes(a, b, e, &out->axis1, &out->axis2);
     if (cov2D) { cov2D[0] = a; cov2D[1] = b; cov2D[2] = e; }
     return true;
@@ -782,6 +792,66 @@ static float LinearizationError(Vector2 c1, const float *cov1, Vector2 c2, const
 }
 
 // ----------------------------------------------------------------------------
+// STEP 6e: Normals (view 6)
+//
+// A flat splat (a disc) lies along a surface, so its shortest axis is that
+// surface's normal. View 6 draws every splat's center as a point (as view 3)
+// and its shortest axis as an arrow from it:
+//   - k sigma of the longest axis long ([ and ]; +/- scales it too)
+//   - turned to the side the camera is on (the sign of an axis means nothing)
+//   - colored by its direction as in normal maps, RGB = (n + 1)/2: a floor (+Y)
+//     is light green
+//   - as opaque as the splat is flat, 1 - sigma_min/sigma_mid: a ball or a
+//     needle has no normal, and its arrow fades out
+// Here the axis is the column of R with the smallest sigma. The GPU only has
+// the covariance, and takes its eigenvector of the smallest eigenvalue
+// (NormalOf() in SPLAT_VS).
+// Fills the 6 corners of the arrow in pixels, 2 triangles: shaft, head.
+// ----------------------------------------------------------------------------
+static bool NormalArrow(const Splat *s, const ViewParams *v, float scaleMod, float k, Vector2 corners[6], Color *color)
+{
+    float R[3][3];
+    QuatToMat3(s->rotation, R);
+    const float sc[3] = { s->scale.x, s->scale.y, s->scale.z };
+    int lo = 0, hi = 0;
+    for (int i = 1; i < 3; i++) {
+        if (sc[i] < sc[lo]) lo = i;
+        if (sc[i] > sc[hi]) hi = i;
+    }
+    if (lo == hi) return false;  // a ball
+    int mid = 3 - lo - hi;
+    Vector3 n = { R[0][lo], R[1][lo], R[2][lo] };
+    if (Vector3DotProduct(n, Vector3Subtract(v->eye, s->position)) < 0.0f) n = Vector3Negate(n);
+    float flatness = 1.0f - sc[lo]/fmaxf(sc[mid], 1e-30f);
+
+    auto project = [&](Vector3 p, Vector2 *px) {  // STEP 4's pinhole
+        Vector3 d = Vector3Subtract(p, v->eye);
+        float z = Vector3DotProduct(d, v->forward);
+        *px = Vector2{ v->cx + v->focal*Vector3DotProduct(d, v->right)/z,
+                       v->cy - v->focal*Vector3DotProduct(d, v->up)/z };
+        return z >= NEAR_PLANE;
+    };
+    Vector2 base, tip;
+    if (!project(s->position, &base) || !project(Vector3Add(s->position, Vector3Scale(n, k*scaleMod*sc[hi])), &tip)) {
+        return false;
+    }
+    float len = Vector2Distance(base, tip);
+    if (len < 0.5f || flatness <= 0.0f) return false;  // seen end-on, or no normal
+    Vector2 dir = Vector2Scale(Vector2Subtract(tip, base), 1.0f/len), perp = { -dir.y, dir.x };
+    float head = fminf(8.0f, 0.4f*len);
+    Vector2 headBase = Vector2Subtract(tip, Vector2Scale(dir, head));
+    corners[0] = Vector2Add(base, perp);  // shaft: 2 px wide at the point, to a tip at the head
+    corners[1] = Vector2Subtract(base, perp);
+    corners[2] = headBase;
+    corners[3] = tip;                     // head
+    corners[4] = Vector2Add(headBase, Vector2Scale(perp, 0.5f*head));
+    corners[5] = Vector2Subtract(headBase, Vector2Scale(perp, 0.5f*head));
+    *color = Color{ (unsigned char)((0.5f*n.x + 0.5f)*255.0f), (unsigned char)((0.5f*n.y + 0.5f)*255.0f),
+                    (unsigned char)((0.5f*n.z + 0.5f)*255.0f), (unsigned char)(flatness*255.0f) };
+    return true;
+}
+
+// ----------------------------------------------------------------------------
 // STEP 6c: The rays of view 4, which draws the 2-sigma ellipsoids themselves
 //
 // The fragment shader casts each pixel's ray at the ellipsoid and shades the
@@ -791,15 +861,20 @@ static float LinearizationError(Vector2 c1, const float *cov1, Vector2 c2, const
 // at distance L. A pixel's ray (x/z, y/z, 1) in camera axes is then M times
 // that vector there: linear in the pixel position, so the shader gets it
 // interpolated exactly from the rectangle's corners.
+// The ellipsoid is at k sigma ([ and ]) rather than 2 when k is changed.
 // Returns L and fills M.
 // ----------------------------------------------------------------------------
-static float EllipsoidRayFrame(const Splat *s, const ViewParams *v, float scaleMod, float M[3][3])
+static float EllipsoidRayFrame(const Splat *s, const ViewParams *v, float scaleMod, float k, float M[3][3],
+                               float extraVariance = 0.0f)
 {
     float R[3][3];
     QuatToMat3(s->rotation, R);
-    Vector3 inv = { 1.0f/fmaxf(2.0f*scaleMod*s->scale.x, 1e-7f), 1.0f/fmaxf(2.0f*scaleMod*s->scale.y, 1e-7f),
-                    1.0f/fmaxf(2.0f*scaleMod*s->scale.z, 1e-7f) };
-    // diag(1/(2 sigma)) Rᵀ w: w along the splat's axes (R's columns), in units of 2 sigma
+    // Σ + extraVariance I keeps the axes R and adds to each sigma²
+    auto invAxis = [&](float sigma) {
+        return 1.0f/fmaxf(k*sqrtf(scaleMod*scaleMod*sigma*sigma + extraVariance), 1e-7f);
+    };
+    Vector3 inv = { invAxis(s->scale.x), invAxis(s->scale.y), invAxis(s->scale.z) };
+    // diag(1/(k sigma)) Rᵀ w: w along the splat's axes (R's columns), in units of k sigma
     auto whiten = [&](Vector3 w) {
         return Vector3{ inv.x*(R[0][0]*w.x + R[1][0]*w.y + R[2][0]*w.z),
                         inv.y*(R[0][1]*w.x + R[1][1]*w.y + R[2][1]*w.z),
@@ -919,6 +994,42 @@ static void SortBackToFront(const ProjectedSplat *proj, const int *visible, int 
 }
 
 // ----------------------------------------------------------------------------
+// STEP 6f: Gaussians per ray, without the linearization (view 7)
+//
+// View 1 draws STEP 5's 2D Gaussian. View 7 evaluates the 3D Gaussian itself
+// along each pixel's ray, at its peak there, as 3DGUT and 3DGRT do. In the
+// whitened frame of STEP 6c the Gaussian is round, so its peak along a ray is
+// where the ray comes closest to the center:
+//     h² = min over t of |o + t d|² = L² (dx² + dy²) / |d|²
+//     alpha = opacity · exp(-h²/2)
+// (h in sigmas; the frame here is in units of 3 sigma, the cutoff of view 1,
+// so the shader scales h by 3). The rectangle is the exact 3-sigma outline of
+// STEP 6b. A splat whose outline does not close, because it reaches behind the
+// camera, gets the whole screen, and the rays decide. Those are the big splats
+// right in front of the camera, the ones STEP 5 gets most wrong.
+// STEP 5's low-pass filter becomes a blur in 3D: every splat gets an extra
+// variance in all directions that adds 0.3 px² at its depth, so splats smaller
+// than a pixel still cover one, and views 1 and 7 differ by the linearization
+// alone.
+// ----------------------------------------------------------------------------
+#define PER_RAY_SIGMA 3.0f  // view 7's frame and cutoff, in sigmas (also in SPLAT_VS and SPLAT_FS)
+
+static float LowPass3D(float depth, float focal)
+{
+    return 0.3f*(depth/focal)*(depth/focal);  // world units²: 0.3 px² at this depth
+}
+
+// The rectangle of a splat whose outline does not close: the whole screen
+static void CoverScreen(ProjectedSplat *p, const ViewParams *v)
+{
+    float half = fmaxf(v->cx, v->cy) + 1.0f;
+    float axis = half/(PER_RAY_SIGMA + 1.0f);  // DrawSplats makes the rectangle reach this far 4 times
+    p->center = Vector2{ v->cx, v->cy };
+    p->axis1 = Vector2{ axis, 0.0f };
+    p->axis2 = Vector2{ 0.0f, axis };
+}
+
+// ----------------------------------------------------------------------------
 // STEP 8: The fragment shader
 //
 // Each splat is drawn as a rectangle spanning ±3 sigma along both ellipse
@@ -938,9 +1049,26 @@ static const char *SPLAT_FS =
     "in vec3 fragRay;        // view 4: the pixel's ray in the splat's whitened frame (STEP 6c)\n"
     "in float fragEyeDist;   // view 4: L, the eye's distance from the splat center in that frame\n"
     "in vec2 fragViewXY;     // view 4: the pixel's ray (x/z, y/z, 1) in camera axes\n"
-    "uniform int mode;       // ViewMode: 0 gaussian, 1 ellipse outline, 2 solid dot, 3 ellipsoid, 4 gaussian\n"
+    "uniform int mode;       // ViewMode: 0 gaussian, 1 ellipse outline, 2 dot, 3 ellipsoid, 4 gaussian, 5 arrow,\n"
+    "                        // 6 gaussian per ray\n"
+    "uniform int flatQuads;  // B: fill each quad with its color, to see what the vertex shader drew\n"
+    "uniform float drawSigma;  // k: view 2 draws its ring at k sigma ([ and ])\n"
     "out vec4 finalColor;\n"
     "void main() {\n"
+    "    if (flatQuads == 1) { finalColor = vec4(fragColor.rgb, 1.0); return; }  // no work done here\n"
+    "    if (mode == 5) { finalColor = fragColor; return; }  // view 6's arrows: flat\n"
+    "    if (mode == 6) {\n"
+    "        // View 7 (STEP 6f): the Gaussian at its peak along the pixel's ray, where the\n"
+    "        // ray comes closest to the center. The frame is in units of 3 sigma.\n"
+    "        float L = fragEyeDist, a = dot(fragRay, fragRay);\n"
+    "        float h2 = (fragRay.z > 0.0) ? L*L*dot(fragRay.xy, fragRay.xy)/a  // closest point ahead\n"
+    "                                     : L*L;                               // or the eye itself\n"
+    "        if (h2 > 1.0) discard;                     // beyond 3 sigma, as view 1\n"
+    "        float alpha = fragColor.a*exp(-4.5*h2);    // exp(-(3h)²/2)\n"
+    "        if (alpha < 1.0/255.0) discard;\n"
+    "        finalColor = vec4(fragColor.rgb, alpha);\n"
+    "        return;\n"
+    "    }\n"
     "    if (mode == 3) {\n"
     "        // In the whitened frame the ellipsoid is the unit sphere and the eye is at\n"
     "        // (0, 0, -L): solve |eye + t*ray|² = 1 for the nearer t.\n"
@@ -956,14 +1084,14 @@ static const char *SPLAT_FS =
     "        return;\n"
     "    }\n"
     "    float r2 = dot(fragTexCoord, fragTexCoord);\n"
-    "    if (r2 > 9.0) discard;   // outside 3 sigma: cut off\n"
+    "    if (r2 > 9.0 && mode != 1) discard;   // outside 3 sigma: cut off (the ring may lie further out)\n"
     "    float alpha;\n"
     "    if (mode == 0 || mode == 4) {\n"
     "        alpha = fragColor.a * exp(-0.5 * r2);\n"
     "    } else if (mode == 1) {\n"
     "        float r = sqrt(r2);\n"
     "        float px = fwidth(r);   // how many sigmas one pixel spans here\n"
-    "        alpha = 1.0 - smoothstep(0.0, 1.5 * px, abs(r - 2.0));  // ring at 2 sigma\n"
+    "        alpha = 1.0 - smoothstep(0.0, 1.5 * px, abs(r - drawSigma));  // ring at k sigma\n"
     "    } else {\n"
     "        alpha = 1.0;\n"
     "    }\n"
@@ -999,11 +1127,40 @@ static const char *QUAD_VS =
 
 // dotSize: diameter in pixels of the dots of the centers view.
 // splats, v, scaleMod: for the rays of view 4.
+// drawSigma: views 2 and 4 draw the k-sigma ellipse or ellipsoid ([ and ]).
+// flatQuads: the fragment shader just fills the quads (B).
 static void DrawSplats(const ProjectedSplat *proj, const int *order, int count, ViewMode mode, float dotSize,
-                       const Splat *splats, const ViewParams *v, float scaleMod, Shader shader, int modeLoc)
+                       const Splat *splats, const ViewParams *v, float scaleMod, float drawSigma, Shader shader,
+                       int modeLoc, bool flatQuads)
 {
-    int shaderMode = mode;
+    if (mode == VIEW_NORMALS) {  // STEP 6e: the points, then their arrows over them
+        DrawSplats(proj, order, count, VIEW_CENTERS, dotSize, splats, v, scaleMod, drawSigma, shader, modeLoc,
+                   flatQuads);
+        int arrowMode = VIEW_NORMALS;
+        SetShaderValue(shader, modeLoc, &arrowMode, SHADER_UNIFORM_INT);
+        BeginShaderMode(shader);
+        rlDisableBackfaceCulling();  // arrows point every way, so their triangles turn both ways
+        rlBegin(RL_TRIANGLES);
+        for (int i = 0; i < count; i++) {
+            Vector2 corners[6];
+            Color c;
+            if (!NormalArrow(&splats[order[i]], v, scaleMod, drawSigma, corners, &c)) continue;
+            rlColor4ub(c.r, c.g, c.b, c.a);
+            for (Vector2 corner : corners) rlVertex2f(corner.x, corner.y);
+        }
+        rlEnd();
+        EndShaderMode();
+        rlDrawRenderBatchActive();
+        rlEnableBackfaceCulling();
+        return;
+    }
+    int shaderMode = mode, flat = flatQuads;
     SetShaderValue(shader, modeLoc, &shaderMode, SHADER_UNIFORM_INT);
+    SetShaderValue(shader, GetShaderLocation(shader, "flatQuads"), &flat, SHADER_UNIFORM_INT);
+    SetShaderValue(shader, GetShaderLocation(shader, "drawSigma"), &drawSigma, SHADER_UNIFORM_FLOAT);
+    // the quads reach 3 sigma; views 2 and 4 draw at k sigma, so they need k + 1
+    float reach = (mode == VIEW_ELLIPSES || mode == VIEW_ELLIPSOIDS) ? fmaxf(3.0f, drawSigma + 1.0f)
+                  : (mode == VIEW_PER_RAY) ? PER_RAY_SIGMA + 1.0f : 3.0f;
     Vector3 pinhole = { v->focal, v->cx, v->cy };
     SetShaderValue(shader, GetShaderLocation(shader, "pinhole"), &pinhole, SHADER_UNIFORM_VEC3);
 
@@ -1014,10 +1171,10 @@ static void DrawSplats(const ProjectedSplat *proj, const int *order, int count, 
         const ProjectedSplat *p = &proj[idx];
         Color c = p->color;
 
-        // Rectangle corners: center ± 3*axis1 ± 3*axis2.
+        // Rectangle corners: center ± reach*axis1 ± reach*axis2 (reach = 3 sigma, or more, see above).
         // In "centers" mode, draw a round dot of dotSize pixels instead of the ellipse.
-        Vector2 a1 = Vector2Scale(p->axis1, 3.0f);
-        Vector2 a2 = Vector2Scale(p->axis2, 3.0f);
+        Vector2 a1 = Vector2Scale(p->axis1, reach);
+        Vector2 a2 = Vector2Scale(p->axis2, reach);
         if (mode == VIEW_CENTERS) {
             a1 = Vector2{ 0.5f*dotSize, 0.0f };
             a2 = Vector2{ 0.0f, 0.5f*dotSize };
@@ -1029,10 +1186,12 @@ static void DrawSplats(const ProjectedSplat *proj, const int *order, int count, 
         // works for every splat.
         const float corners[4][2] = { { -1, -1 }, { -1, 1 }, { 1, 1 }, { 1, -1 } };
         rlColor4ub(c.r, c.g, c.b, c.a);
-        if (mode == VIEW_ELLIPSOIDS) {
-            // STEP 6c: each corner's ray in the ellipsoid's whitened frame
+        if (mode == VIEW_ELLIPSOIDS || mode == VIEW_PER_RAY) {
+            // STEP 6c: each corner's ray in the ellipsoid's whitened frame (view 7: 3 sigma, blurred, STEP 6f)
             float M[3][3];
-            float L = EllipsoidRayFrame(&splats[idx], v, scaleMod, M);
+            bool perRay = (mode == VIEW_PER_RAY);
+            float L = EllipsoidRayFrame(&splats[idx], v, scaleMod, perRay ? PER_RAY_SIGMA : drawSigma, M,
+                                        perRay ? LowPass3D(p->depth, v->focal) : 0.0f);
             rlNormal3f(1.0f, L, 0.0f);
             for (const auto &k : corners) {
                 Vector2 px = { p->center.x + k[0]*a1.x + k[1]*a2.x, p->center.y + k[0]*a1.y + k[1]*a2.y };
@@ -1042,7 +1201,7 @@ static void DrawSplats(const ProjectedSplat *proj, const int *order, int count, 
             }
         } else {
             for (const auto &k : corners) {
-                rlTexCoord2f(3*k[0], 3*k[1]);
+                rlTexCoord2f(reach*k[0], reach*k[1]);
                 rlVertex2f(p->center.x + k[0]*a1.x + k[1]*a2.x, p->center.y + k[0]*a1.y + k[1]*a2.y);
             }
         }
@@ -1090,8 +1249,10 @@ uniform float scaleMod;
 uniform int shDegree;                      // 0 = base color only
 uniform mat4 toFileFrame;                  // world direction -> frame the SH were trained in
 uniform int mode;                          // ViewMode: 0 gaussian, 1 ellipse outline, 2 solid dot, 3 ellipsoid,
-                                           // 4 gaussian colored by the linearization error
+                                           // 4 gaussian colored by the linearization error, 5 normal arrow,
+                                           // 6 gaussian per ray
 uniform float dotSize;                     // dot diameter in pixels (mode 2)
+uniform float drawSigma;                   // k: views 2, 4 and 5 use the k-sigma ellipse/ellipsoid ([ and ])
 
 out vec2 fragTexCoord;                     // the same outputs as QUAD_VS, the vertex shader of the
 out vec4 fragColor;                        // CPU path, so the fragment shader is shared with it
@@ -1126,6 +1287,30 @@ vec3 SolveLower(mat3 C, vec3 v)
     float y0 = v.x/C[0][0];
     float y1 = (v.y - C[0][1]*y0)/C[1][1];
     return vec3(y0, y1, (v.z - C[0][2]*y0 - C[1][2]*y1)/C[2][2]);
+}
+
+// STEP 6e (view 6): the shortest axis of the covariance S (the normal of a flat
+// splat) in xyz, how flat it is (1 - sigma_min/sigma_mid) in w, and the longest
+// sigma, from the eigenvalues of a symmetric 3x3 by the trigonometric method
+vec4 NormalOf(mat3 S, out float sigmaMax)
+{
+    float q = (S[0][0] + S[1][1] + S[2][2])/3.0;
+    mat3 B = S - q*mat3(1.0);
+    float p = sqrt((B[0][0]*B[0][0] + B[1][1]*B[1][1] + B[2][2]*B[2][2]
+                    + 2.0*(S[0][1]*S[0][1] + S[0][2]*S[0][2] + S[1][2]*S[1][2]))/6.0);
+    sigmaMax = sqrt(max(q, 0.0));
+    if (p < 1e-6*q) return vec4(0.0, 1.0, 0.0, 0.0);  // a ball: no normal
+    float phi = acos(clamp(0.5*determinant(B/p), -1.0, 1.0))/3.0;
+    float l1 = q + 2.0*p*cos(phi), l3 = q + 2.0*p*cos(phi + 2.0943951);  // largest, smallest
+    float l2 = 3.0*q - l1 - l3;
+    sigmaMax = sqrt(l1);
+    // the eigenvector of l3 is perpendicular to the rows of S - l3 I: the longest cross product of two
+    mat3 M = S - l3*mat3(1.0);
+    vec3 n = cross(M[0], M[1]), c1 = cross(M[0], M[2]), c2 = cross(M[1], M[2]);
+    if (dot(c1, c1) > dot(n, n)) n = c1;
+    if (dot(c2, c2) > dot(n, n)) n = c2;
+    if (dot(n, n) < 1e-30) return vec4(0.0, 1.0, 0.0, 0.0);  // a needle: no normal either
+    return vec4(normalize(n), 1.0 - sqrt(max(l3, 0.0)/max(l2, 1e-30)));
 }
 
 // STEP 6d (view 5): the Hellinger distance of two 2D Gaussians, as in LinearizationError()
@@ -1199,13 +1384,42 @@ void main()
     float e = dot(T1, Sigma*T1) + 0.3;
     vec2 center = vec2(0.5*screenSize.x + focal*tx/tz, 0.5*screenSize.y - focal*ty/tz);
 
-    // STEP 6b (views 4 and 5): the exact outline of the 2-sigma ellipsoid, as in ProjectSplatExact()
+    // STEP 6e (view 6, its second draw): the normal arrow, as in NormalArrow(). The 6 vertices
+    // of the instance make 2 triangles, shaft and head, picked by gl_VertexID.
+    if (mode == 5) {
+        float sigmaMax;
+        vec4 nf = NormalOf(Sigma, sigmaMax);
+        vec3 n = (dot(nf.xyz, eye - t0.xyz) < 0.0) ? -nf.xyz : nf.xyz;  // the side the camera is on
+        vec3 q = t0.xyz + n*(drawSigma*sigmaMax) - eye;
+        float qz = dot(q, camForward);
+        vec2 tip = vec2(0.5*screenSize.x + focal*dot(q, camRight)/qz, 0.5*screenSize.y - focal*dot(q, camUp)/qz);
+        float len = length(tip - center);
+        if (qz < 0.2 || len < 0.5 || nf.w <= 0.0) { gl_Position = vec4(2.0, 2.0, 0.0, 1.0); return; }  // not drawn
+        vec2 dir = (tip - center)/len, perp = vec2(-dir.y, dir.x);
+        float head = min(8.0, 0.4*len);
+        vec2 headBase = tip - head*dir;
+        vec2 corners[6] = vec2[6](center + perp, center - perp, headBase,                    // shaft
+                                  tip, headBase + 0.5*head*perp, headBase - 0.5*head*perp);  // head
+        vec2 pixel = corners[gl_VertexID % 6];
+        fragTexCoord = vec2(0.0);
+        fragRay = vec3(0.0);
+        fragEyeDist = 0.0;
+        fragViewXY = vec2(0.0);
+        fragColor = vec4(0.5*n + 0.5, nf.w);
+        gl_Position = vec4(2.0*pixel.x/screenSize.x - 1.0, 1.0 - 2.0*pixel.y/screenSize.y, 0.0, 1.0);
+        return;
+    }
+
+    // STEP 6b (views 4, 5, 7): the exact outline of the k-sigma ellipsoid, as in ProjectSplatExact().
+    // View 7 takes it at 3 sigma, of the splat blurred in 3D (LowPass3D(), STEP 6f).
+    float k = (mode == 6) ? 3.0 : drawSigma;
+    mat3 SigmaX = (mode == 6) ? Sigma + 0.3*(tz/focal)*(tz/focal)*mat3(1.0) : Sigma;
     bool exact = false;                            // false: the outline does not close
     vec2 exactCenter = center;
     float ea = a, eb = b, ee = e;
-    if (mode == 3 || mode == 4) {
+    if (mode == 3 || mode == 4 || mode == 6) {
         mat3 Wt = mat3(camRight, camUp, camForward);  // columns = camera axes, so W = transpose(Wt)
-        mat3 Sc = 4.0*(transpose(Wt)*Sigma*Wt);        // 2 sigma, in camera axes
+        mat3 Sc = k*k*(transpose(Wt)*SigmaX*Wt);       // k sigma, in camera axes
         vec2 m = vec2(tx, ty), g = vec2(Sc[2][0], Sc[2][1]);
         float D = tz*tz - Sc[2][2];
         exact = (D > 0.0);
@@ -1214,13 +1428,14 @@ void main()
             mat2 S = (D*mat2(Sc[0][0], Sc[0][1], Sc[1][0], Sc[1][1]) + Sc[2][2]*outerProduct(m, m)
                       - tz*(outerProduct(m, g) + outerProduct(g, m)) + outerProduct(g, g))/(D*D);
             exactCenter = vec2(0.5*screenSize.x + focal*c.x, 0.5*screenSize.y - focal*c.y);
-            ea = 0.25*focal*focal*S[0][0] + 0.3;
-            eb = -0.25*focal*focal*S[0][1];
-            ee = 0.25*focal*focal*S[1][1] + 0.3;
+            float toSigma1 = focal*focal/(k*k);  // pixels, and k sigma back to 1 sigma
+            ea = toSigma1*S[0][0] + 0.3;
+            eb = -toSigma1*S[0][1];
+            ee = toSigma1*S[1][1] + 0.3;
         }
     }
-    if (mode == 3) {
-        if (!exact) { gl_Position = vec4(2.0, 2.0, 0.0, 1.0); return; }  // off screen: not drawn
+    if (mode == 3 && !exact) { gl_Position = vec4(2.0, 2.0, 0.0, 1.0); return; }  // view 4: off screen, not drawn
+    if ((mode == 3 || mode == 6) && exact) {
         center = exactCenter;
         a = ea;
         b = eb;
@@ -1236,8 +1451,15 @@ void main()
     float lambda2 = max(mid - radius, 0.1);
     vec2 dir1 = (abs(b) > 1e-6) ? normalize(vec2(b, lambda1 - a)) : ((a >= e) ? vec2(1.0, 0.0) : vec2(0.0, 1.0));
     vec2 dir2 = vec2(-dir1.y, dir1.x);
-    vec2 a1 = 3.0*dir1*min(sqrt(lambda1), 1024.0);
-    vec2 a2 = 3.0*dir2*min(sqrt(lambda2), 1024.0);
+    float reach = (mode == 1 || mode == 3) ? max(3.0, drawSigma + 1.0)    // views 2 and 4 draw at k sigma
+                  : (mode == 6) ? 4.0 : 3.0;                              // view 7 at 3
+    vec2 a1 = reach*dir1*min(sqrt(lambda1), 1024.0);
+    vec2 a2 = reach*dir2*min(sqrt(lambda2), 1024.0);
+    if (mode == 6 && !exact) {  // view 7: the outline does not close, so the whole screen (CoverScreen())
+        center = 0.5*screenSize;
+        a1 = vec2(0.5*max(screenSize.x, screenSize.y) + 1.0, 0.0);
+        a2 = vec2(0.0, a1.x);
+    }
 
     // STEP 5b: color seen from this camera
     vec4 color = vec4(EvalSH(s, mat3(toFileFrame)*normalize(d)), t0.w);
@@ -1245,15 +1467,15 @@ void main()
     if (mode == 4) color.rgb = Ramp(linearizationError/0.5);  // 0.5 = LINEARIZATION_RED
 
     vec2 pixel = center + corner.x*a1 + corner.y*a2;
-    fragTexCoord = 3.0*corner;
+    fragTexCoord = reach*corner;
     fragColor = color;
 
-    // STEP 6c (view 4): this corner's ray in the ellipsoid's whitened frame, as in EllipsoidRayFrame()
+    // STEP 6c (views 4, 7): this corner's ray in the ellipsoid's whitened frame, as in EllipsoidRayFrame()
     fragViewXY = vec2(pixel.x - 0.5*screenSize.x, 0.5*screenSize.y - pixel.y)/focal;
     fragRay = vec3(0.0);
     fragEyeDist = 0.0;
-    if (mode == 3) {
-        mat3 C = Cholesky(4.0*Sigma);              // 2 sigma
+    if (mode == 3 || mode == 6) {
+        mat3 C = Cholesky(k*k*SigmaX);             // k sigma
         vec3 o = SolveLower(C, eye - t0.xyz);      // the eye
         fragEyeDist = length(o);
         vec3 e3 = -o/fragEyeDist;                  // the turned frame: e3 from the eye to the center
@@ -1419,11 +1641,16 @@ static void UpdateGpuGeometry(GpuRenderer *g, const std::vector<Splat> &splats)
 // order: the draw order, one int per instance, uploaded as it is. NULL when
 // it is already in the buffer (the GPU sort of STEP 10 writes it there).
 static void DrawSplatsGpu(GpuRenderer *g, const int *order, int count, const ViewParams *v, Vector2 screen,
-                          float scaleMod, int shDegree, Quaternion toFileFrame, ViewMode mode, float dotSize)
+                          float scaleMod, int shDegree, Quaternion toFileFrame, ViewMode mode, float dotSize,
+                          float drawSigma, bool flatQuads)
 {
     if (count == 0) return;
 
     if (order) rlUpdateVertexBuffer(g->orderVbo, order, count*(int)sizeof(int), 0);
+    if (mode == VIEW_NORMALS) {  // STEP 6e: the points first; the arrows below (shader mode 5)
+        DrawSplatsGpu(g, NULL, count, v, screen, scaleMod, shDegree, toFileFrame, VIEW_CENTERS, dotSize, drawSigma,
+                      flatQuads);
+    }
 
     int shaderMode = mode;
     SetShaderValue(g->shader, g->locEye, &v->eye, SHADER_UNIFORM_VEC3);
@@ -1436,6 +1663,9 @@ static void DrawSplatsGpu(GpuRenderer *g, const int *order, int count, const Vie
     SetShaderValue(g->shader, g->locShDegree, &shDegree, SHADER_UNIFORM_INT);
     SetShaderValue(g->shader, g->locMode, &shaderMode, SHADER_UNIFORM_INT);
     SetShaderValue(g->shader, g->locDotSize, &dotSize, SHADER_UNIFORM_FLOAT);
+    int flat = flatQuads;
+    SetShaderValue(g->shader, GetShaderLocation(g->shader, "flatQuads"), &flat, SHADER_UNIFORM_INT);
+    SetShaderValue(g->shader, GetShaderLocation(g->shader, "drawSigma"), &drawSigma, SHADER_UNIFORM_FLOAT);
     SetShaderValueMatrix(g->shader, g->locToFile, QuaternionToMatrix(toFileFrame));
 
     rlDrawRenderBatchActive();  // draw anything raylib queued before us first
@@ -1446,7 +1676,9 @@ static void DrawSplatsGpu(GpuRenderer *g, const int *order, int count, const Vie
         rlEnableTexture(textures[i]);
     }
     rlEnableVertexArray(g->vao);
+    if (mode == VIEW_NORMALS) rlDisableBackfaceCulling();  // arrows point every way, triangles turn both ways
     rlDrawVertexArrayInstanced(0, 6, count);
+    rlEnableBackfaceCulling();
     rlDisableVertexArray();
     for (int i = 0; i < 4; i++) {
         rlActiveTextureSlot(1 + i);
@@ -1953,6 +2185,148 @@ static Renderer FirstRenderer(const Scene &scene)
 }
 
 // ----------------------------------------------------------------------------
+// STEPs 5-8 for one view: project, sort and draw the splats into the current
+// target (the window, or a texture when C captures every view).
+// ----------------------------------------------------------------------------
+struct RenderOptions {
+    ViewMode mode;
+    Renderer renderer;
+    bool sortEnabled, shEnabled, flatQuads;
+    float scaleMod, dotSize, drawSigma;
+};
+
+struct RenderStats {
+    int visible;
+    double projectMs, sortMs, drawMs;  // CPU time of each part
+};
+
+static RenderStats RenderSplats(Scene &scene, const ViewParams &view, Vector2 screen, const RenderOptions &o,
+                                std::vector<unsigned int> &buckets, Shader shader, int modeLoc)
+{
+    // ---- STEP 5 + 6: project every splat, STEP 5b: its color from this view ----
+    // The SH were trained in the file's frame. The scene was turned to put
+    // its up axis at +Y, so turn the viewing direction back before evaluating them.
+    Quaternion toFileFrame = QuaternionInvert(UpAxisTurn(scene.upAxis));
+    int count = (int)scene.splats.size();
+    double t0 = GetTime();
+    int visibleCount = 0;
+    if (o.renderer == RENDERER_GPU_SORT) {
+        // STEP 10: cull and sort on the GPU, straight into the draw order
+        // (sorting included, so the CPU sort below is skipped).
+        visibleCount = CullAndSortGpu(&scene.gpuSort, &scene.gpu, &view, o.sortEnabled);
+    } else if (o.renderer == RENDERER_GPU) {
+        // STEP 9: the CPU only culls and records the depth for the sort.
+        // Projection, color and corners happen in the vertex shader (STEP 9).
+        for (int i = 0; i < count; i++) {
+            float tx, ty, tz;
+            if (!ToCameraSpace(scene.splats[i].position, &view, &tx, &ty, &tz)) continue;
+            scene.proj[i].depth = tz;
+            scene.visible[visibleCount++] = i;
+        }
+    } else {
+        for (int i = 0; i < count; i++) {
+            const Splat &sp = scene.splats[i];
+            ProjectedSplat &p = scene.proj[i];
+            float linearCov[3];
+            if (!ProjectSplat(&sp, &view, o.scaleMod, &p, linearCov)) continue;
+            if (o.mode == VIEW_ELLIPSOIDS && !ProjectSplatExact(&sp, &view, o.scaleMod, o.drawSigma, &p)) {
+                continue;  // STEP 6b: reaches behind the camera
+            }
+            if (o.mode == VIEW_PER_RAY &&
+                !ProjectSplatExact(&sp, &view, o.scaleMod, PER_RAY_SIGMA, &p, NULL, LowPass3D(p.depth, view.focal))) {
+                CoverScreen(&p, &view);  // STEP 6f: the outline does not close, the rays decide
+            }
+            p.color = sp.color;
+            if (o.shEnabled) {
+                const SphericalHarmonics &sh = scene.sh;
+                Vector3 dir = Vector3Normalize(Vector3Subtract(sp.position, view.eye));
+                dir = Vector3RotateByQuaternion(dir, toFileFrame);
+                p.color = EvalSphericalHarmonics(&sh.coeffs[(size_t)i*sh.perSplat], sh.degree, dir, sp.color.a);
+            }
+            if (o.mode == VIEW_LINEARIZATION_ERROR) {  // STEP 6d
+                ProjectedSplat exact;
+                float exactCov[3];
+                float error = ProjectSplatExact(&sp, &view, o.scaleMod, o.drawSigma, &exact, exactCov)
+                                  ? LinearizationError(p.center, linearCov, exact.center, exactCov) : 1.0f;
+                p.color = RampColor(error/LINEARIZATION_RED);
+                p.color.a = sp.color.a;
+            }
+            scene.visible[visibleCount++] = i;
+        }
+    }
+
+    // ---- STEP 7: sort ----
+    double t1 = GetTime();
+    const int *order = scene.visible.data();  // unsorted = file order
+    if (o.sortEnabled && o.renderer != RENDERER_GPU_SORT) {
+        SortBackToFront(scene.proj.data(), scene.visible.data(), visibleCount, scene.sorted.data(), scene.keys.data(),
+                        buckets.data());
+        order = scene.sorted.data();
+    }
+
+    // ---- STEP 8: draw ----
+    double t2 = GetTime();
+    if (o.renderer == RENDERER_CPU) {
+        DrawSplats(scene.proj.data(), order, visibleCount, o.mode, o.dotSize, scene.splats.data(), &view, o.scaleMod,
+                   o.drawSigma, shader, modeLoc, o.flatQuads);
+    } else {
+        // STEP 10 left the order in the GPU's buffer already: nothing to upload
+        DrawSplatsGpu(&scene.gpu, (o.renderer == RENDERER_GPU_SORT) ? NULL : order, visibleCount, &view, screen,
+                      o.scaleMod, o.shEnabled ? scene.sh.degree : 0, toFileFrame, o.mode, o.dotSize, o.drawSigma,
+                      o.flatQuads);
+    }
+    double t3 = GetTime();
+    return RenderStats{ visibleCount, (t1 - t0)*1000.0, (t2 - t1)*1000.0, (t3 - t2)*1000.0 };
+}
+
+// ----------------------------------------------------------------------------
+// C: every view from this camera in one picture, a sheet of 4 x 2 at half the
+// window size each (CAPTURE_SCALE), with each view's name, saved as
+// views_<date>_<time>.png where the viewer was started.
+// Returns what to show: the file name, or why it could not be written.
+// ----------------------------------------------------------------------------
+#define CAPTURE_SCALE 0.5f  // each view's size on the sheet, relative to the window
+
+static std::string CaptureAllViews(Scene &scene, const ViewParams &view, Vector2 screen, RenderOptions o,
+                                   std::vector<unsigned int> &buckets, Shader shader, int modeLoc)
+{
+    const Color background = { 20, 20, 26, 255 };
+    int w = (int)screen.x, h = (int)screen.y;                          // rendered at the window's size,
+    int cw = (int)(w*CAPTURE_SCALE), ch = (int)(h*CAPTURE_SCALE);      // then shrunk to a cell
+    const int columns = 4, rows = (VIEW_MODE_COUNT + columns - 1)/columns;
+    RenderTexture2D target = LoadRenderTexture(w, h);
+    Image sheet = GenImageColor(columns*cw, rows*ch, background);
+    for (int m = 0; m < VIEW_MODE_COUNT; m++) {
+        o.mode = (ViewMode)m;
+        BeginTextureMode(target);
+        ClearBackground(background);
+        RenderSplats(scene, view, screen, o, buckets, shader, modeLoc);
+        EndTextureMode();
+        Image frame = LoadImageFromTexture(target.texture);
+        ImageFlipVertical(&frame);  // render textures are stored bottom row first
+        // the window shows colors only; blending leaves alpha below 1 in a texture
+        for (int i = 0; i < w*h; i++) ((unsigned char *)frame.data)[4*i + 3] = 255;
+        ImageResize(&frame, cw, ch);  // averages the pixels, so thin lines and dots stay visible
+        int x = (m % columns)*cw, y = (m/columns)*ch;
+        Rectangle all = { 0, 0, (float)cw, (float)ch }, cell = { (float)x, (float)y, (float)cw, (float)ch };
+        ImageDraw(&sheet, frame, all, cell, WHITE);
+        UnloadImage(frame);
+        const char *label = TextFormat("[%d] %s", m + 1, viewNames[m]);
+        ImageDrawRectangle(&sheet, x + 6, y + 6, MeasureText(label, 16) + 12, 24, BLACK);
+        ImageDrawText(&sheet, label, x + 12, y + 10, 16, RAYWHITE);
+    }
+    UnloadRenderTexture(target);
+    char name[64];
+    time_t now = time(NULL);
+    strftime(name, sizeof(name), "views_%Y%m%d_%H%M%S", localtime(&now));
+    std::string file = std::string(name) + ".png";
+    for (int n = 2; FileExists(file.c_str()); n++) file = TextFormat("%s_%d.png", name, n);  // two in one second
+    bool saved = ExportImage(sheet, file.c_str());
+    UnloadImage(sheet);
+    return (saved ? "saved " : "could not write ") + file;
+}
+
+// ----------------------------------------------------------------------------
 // Main: load, then each frame  input -> project -> sort -> draw
 // ----------------------------------------------------------------------------
 int main(int argc, char **argv)
@@ -1973,6 +2347,11 @@ int main(int argc, char **argv)
     FlyCamera cam = StartCamera(scene);
     ViewMode mode = scene.pointCloud ? VIEW_CENTERS : VIEW_GAUSSIANS;
     bool sortEnabled = true;
+    bool flatQuads = false;  // B: show the quads the vertex shader draws, filled flat
+    const float DRAW_SIGMA = 2.0f;
+    float drawSigma = DRAW_SIGMA;  // [ and ]: the k of the k-sigma ellipses and ellipsoids of views 2, 4, 5
+    std::string captureMessage;    // C: what the last capture of all views did, shown for a few seconds
+    double captureTime = -100.0;
     Renderer renderer = FirstRenderer(scene);
     bool shEnabled = (scene.sh.degree > 0);
     float scaleMod = 1.0f;
@@ -2003,6 +2382,7 @@ int main(int argc, char **argv)
                 shEnabled = (scene.sh.degree > 0);
                 scaleMod = 1.0f;
                 dotSize = DOT_SIZE;
+                drawSigma = DRAW_SIGMA;
                 dropFailed.clear();
             } else {
                 dropFailed = GetFileName(path.c_str());
@@ -2043,7 +2423,12 @@ int main(int argc, char **argv)
         if (IsKeyPressed(KEY_THREE)) mode = VIEW_CENTERS;
         if (IsKeyPressed(KEY_FOUR)) mode = VIEW_ELLIPSOIDS;
         if (IsKeyPressed(KEY_FIVE)) mode = VIEW_LINEARIZATION_ERROR;
+        if (IsKeyPressed(KEY_SIX)) mode = VIEW_NORMALS;
+        if (IsKeyPressed(KEY_SEVEN)) mode = VIEW_PER_RAY;
         if (IsKeyPressed(KEY_O)) sortEnabled = !sortEnabled;
+        if (IsKeyPressed(KEY_B)) flatQuads = !flatQuads;
+        if (IsKeyPressed(KEY_RIGHT_BRACKET)) drawSigma = fminf(drawSigma + 0.5f, 5.0f);
+        if (IsKeyPressed(KEY_LEFT_BRACKET)) drawSigma = fmaxf(drawSigma - 0.5f, 0.5f);
         if (IsKeyPressed(KEY_H) && scene.sh.degree > 0) shEnabled = !shEnabled;
         // +/- size what the view shows: the dots in the centers view, else the splats
         float grow = (IsKeyDown(KEY_EQUAL) || IsKeyDown(KEY_KP_ADD)) ? 1.02f : 1.0f;
@@ -2054,86 +2439,30 @@ int main(int argc, char **argv)
         // Z swaps Z up and Z front, F cycles through all the up axes
         if (IsKeyPressed(KEY_Z)) SetUpAxis(&scene, &cam, (scene.upAxis == UP_PLUS_Z) ? UP_MINUS_Y : UP_PLUS_Z);
         if (IsKeyPressed(KEY_F)) SetUpAxis(&scene, &cam, (UpAxis)((scene.upAxis + 1) % UP_AXIS_COUNT));
-        if (IsKeyPressed(KEY_R)) { cam = StartCamera(scene); scaleMod = 1.0f; dotSize = DOT_SIZE; }
+        if (IsKeyPressed(KEY_R)) {
+            cam = StartCamera(scene);
+            scaleMod = 1.0f;
+            dotSize = DOT_SIZE;
+            drawSigma = DRAW_SIGMA;
+        }
         view = MakeView(&cam, GetScreenWidth(), GetScreenHeight());
 
-        // ---- STEP 5 + 6: project every splat, STEP 5b: its color from this view ----
-        // The SH were trained in the file's frame. The scene was turned to put
-        // its up axis at +Y, so turn the viewing direction back before evaluating them.
-        Quaternion toFileFrame = QuaternionInvert(UpAxisTurn(scene.upAxis));
-        double t0 = GetTime();
-        int visibleCount = 0;
-        if (renderer == RENDERER_GPU_SORT) {
-            // STEP 10: cull and sort on the GPU, straight into the draw order
-            // (sorting included, so the CPU sort below is skipped).
-            visibleCount = CullAndSortGpu(&scene.gpuSort, &scene.gpu, &view, sortEnabled);
-        } else if (renderer == RENDERER_GPU) {
-            // STEP 9: the CPU only culls and records the depth for the sort.
-            // Projection, color and corners happen in the vertex shader (STEP 9).
-            for (int i = 0; i < count; i++) {
-                float tx, ty, tz;
-                if (!ToCameraSpace(scene.splats[i].position, &view, &tx, &ty, &tz)) continue;
-                scene.proj[i].depth = tz;
-                scene.visible[visibleCount++] = i;
-            }
-        } else {
-            for (int i = 0; i < count; i++) {
-                const Splat &sp = scene.splats[i];
-                ProjectedSplat &p = scene.proj[i];
-                float linearCov[3];
-                if (!ProjectSplat(&sp, &view, scaleMod, &p, linearCov)) continue;
-                if (mode == VIEW_ELLIPSOIDS && !ProjectSplatExact(&sp, &view, scaleMod, &p)) continue;  // STEP 6b
-                p.color = sp.color;
-                if (shEnabled) {
-                    const SphericalHarmonics &sh = scene.sh;
-                    Vector3 dir = Vector3Normalize(Vector3Subtract(sp.position, view.eye));
-                    dir = Vector3RotateByQuaternion(dir, toFileFrame);
-                    p.color = EvalSphericalHarmonics(&sh.coeffs[(size_t)i*sh.perSplat], sh.degree, dir, sp.color.a);
-                }
-                if (mode == VIEW_LINEARIZATION_ERROR) {  // STEP 6d
-                    ProjectedSplat exact;
-                    float exactCov[3];
-                    float error = ProjectSplatExact(&sp, &view, scaleMod, &exact, exactCov)
-                                      ? LinearizationError(p.center, linearCov, exact.center, exactCov) : 1.0f;
-                    p.color = RampColor(error/LINEARIZATION_RED);
-                    p.color.a = sp.color.a;
-                }
-                scene.visible[visibleCount++] = i;
-            }
+        RenderOptions options = { mode, renderer, sortEnabled, shEnabled, flatQuads, scaleMod, dotSize, drawSigma };
+        Vector2 screen = { (float)GetScreenWidth(), (float)GetScreenHeight() };
+        if (IsKeyPressed(KEY_C)) {  // every view from here, in one picture
+            captureMessage = CaptureAllViews(scene, view, screen, options, buckets, shader, modeLoc);
+            captureTime = GetTime();
         }
 
-        // ---- STEP 7: sort ----
-        double t1 = GetTime();
-        const int *order = scene.visible.data();  // unsorted = file order
-        if (sortEnabled && renderer != RENDERER_GPU_SORT) {
-            SortBackToFront(scene.proj.data(), scene.visible.data(), visibleCount, scene.sorted.data(), scene.keys.data(),
-                            buckets.data());
-            order = scene.sorted.data();
-        }
-
-        // ---- STEP 8: draw ----
-        double t2 = GetTime();
         BeginDrawing();
         ClearBackground(Color{ 20, 20, 26, 255 });
-        if (renderer == RENDERER_CPU) {
-            DrawSplats(scene.proj.data(), order, visibleCount, mode, dotSize, scene.splats.data(), &view, scaleMod,
-                       shader, modeLoc);
-        } else {
-            // STEP 10 left the order in the GPU's buffer already: nothing to upload
-            Vector2 screen = { (float)GetScreenWidth(), (float)GetScreenHeight() };
-            DrawSplatsGpu(&scene.gpu, (renderer == RENDERER_GPU_SORT) ? NULL : order, visibleCount, &view, screen, scaleMod,
-                          shEnabled ? scene.sh.degree : 0, toFileFrame, mode, dotSize);
-        }
-        double t3 = GetTime();
+        RenderStats stats = RenderSplats(scene, view, screen, options, buckets, shader, modeLoc);
 
         // ---- HUD ----
-        static const char *modeNames[] = { "Gaussians", "Ellipses, linearized", "Centers", "Ellipsoids, 2 sigma",
-                                           "Linearization error" };
-        static_assert(sizeof(modeNames)/sizeof(modeNames[0]) == VIEW_MODE_COUNT, "one name per view mode");
-        DrawRectangle(8, 8, 400, 322, Fade(BLACK, 0.6f));
-        DrawText(TextFormat("%d FPS   %d / %d %s visible", GetFPS(), visibleCount, count,
+        DrawRectangle(8, 8, 400, 362, Fade(BLACK, 0.6f));
+        DrawText(TextFormat("%d FPS   %d / %d %s visible", GetFPS(), stats.visible, count,
                             scene.pointCloud ? "points" : "splats"), 16, 16, 18, RAYWHITE);
-        double cpuMs[3] = { (t1 - t0)*1000.0, (t2 - t1)*1000.0, (t3 - t2)*1000.0 };
+        double cpuMs[3] = { stats.projectMs, stats.sortMs, stats.drawMs };
         DrawText((renderer == RENDERER_GPU_SORT)
                      ? TextFormat("cull+sort on GPU %.1f ms  draw %.1f ms", scene.gpuSort.lastMs, cpuMs[2])
                  : (renderer == RENDERER_GPU)
@@ -2146,7 +2475,7 @@ int main(int argc, char **argv)
                  dropFailed.empty() ? RAYWHITE : ORANGE);
         DrawText(TextFormat("[G] renderer:   %s", scene.gpuReady ? rendererNames[renderer] : "CPU (GPU unavailable)"),
                  16, 86, 16, (renderer != FirstRenderer(scene)) ? ORANGE : RAYWHITE);
-        DrawText(TextFormat("[1-5] view:     %s", modeNames[mode]), 16, 106, 16, RAYWHITE);
+        DrawText(TextFormat("[1-7] view:     %s", viewNames[mode]), 16, 106, 16, RAYWHITE);
         DrawText(TextFormat("[O] sort:       %s", sortEnabled ? "on (back to front)" : "OFF (file order)"), 16, 126, 16,
                  sortEnabled ? RAYWHITE : ORANGE);
         DrawText((scene.sh.degree == 0) ? "[H] SH color:   none in file"
@@ -2157,16 +2486,25 @@ int main(int argc, char **argv)
                                         : TextFormat("[+/-] scale:    %.2fx", scaleMod), 16, 166, 16, RAYWHITE);
         DrawText(TextFormat("[Z/F] up:       %s", upAxisNames[scene.upAxis]), 16, 186, 16, RAYWHITE);
         DrawText(TextFormat("[wheel] speed:  %.3g / s", cam.speed), 16, 206, 16, RAYWHITE);
-        DrawText("[R] reset camera", 16, 226, 16, RAYWHITE);
-        DrawText("WASD move  Q/E down/up  LMB/RMB look", 16, 254, 16, LIGHTGRAY);
-        DrawText("MMB pan  Shift fast  Ctrl slow", 16, 274, 16, LIGHTGRAY);
-        DrawText("F12 screenshot  Esc quit", 16, 294, 16, LIGHTGRAY);
+        DrawText(flatQuads ? "[B] fill:       FLAT quads (no shading)" : "[B] fill:       fragment shader", 16, 226, 16,
+                 flatQuads ? ORANGE : RAYWHITE);
+        DrawText(TextFormat("[ ] sigma:      %.1f (views 2, 4, 5)", drawSigma), 16, 246, 16,
+                 (drawSigma != DRAW_SIGMA) ? ORANGE : RAYWHITE);
+        DrawText("[R] reset camera", 16, 266, 16, RAYWHITE);
+        DrawText("WASD move  Q/E down/up  LMB/RMB look", 16, 294, 16, LIGHTGRAY);
+        DrawText("MMB pan  Shift fast  Ctrl slow", 16, 314, 16, LIGHTGRAY);
+        DrawText("C all views  F12 screenshot  Esc quit", 16, 334, 16, LIGHTGRAY);
+        if (GetTime() - captureTime < 4.0) {
+            int width = MeasureText(captureMessage.c_str(), 18) + 16;
+            DrawRectangle(8, GetScreenHeight() - 40, width, 32, Fade(BLACK, 0.6f));
+            DrawText(captureMessage.c_str(), 16, GetScreenHeight() - 33, 18, RAYWHITE);
+        }
         if (mode == VIEW_LINEARIZATION_ERROR) {
             // the color scale of view 5 (STEP 6d): Hellinger distance, linearized vs exact
-            DrawRectangle(8, 334, 400, 30, Fade(BLACK, 0.6f));
-            DrawText("exact", 16, 341, 16, RAYWHITE);
-            for (int x = 0; x < 240; x++) DrawRectangle(70 + x, 342, 1, 14, RampColor(x/239.0f));
-            DrawText(TextFormat(">= %.1f off", LINEARIZATION_RED), 318, 341, 16, RAYWHITE);
+            DrawRectangle(8, 374, 400, 30, Fade(BLACK, 0.6f));
+            DrawText("exact", 16, 381, 16, RAYWHITE);
+            for (int x = 0; x < 240; x++) DrawRectangle(70 + x, 382, 1, 14, RampColor(x/239.0f));
+            DrawText(TextFormat(">= %.1f off", LINEARIZATION_RED), 318, 381, 16, RAYWHITE);
         }
         EndDrawing();
     }

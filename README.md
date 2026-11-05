@@ -51,13 +51,16 @@ To open another scene without restarting, drop a `.ply` or `.splat` file on the 
 | Middle drag | pan |
 | Wheel | fly speed (shown in the HUD) |
 | Hold `Shift` / `Ctrl` | fly 4x faster / slower |
-| `1` … `5` | view: Gaussians / 2-sigma ellipse outlines / centers only / solid 2-sigma ellipsoids / Gaussians colored by how far off the linearized projection is (blue: exact, red: far off) |
+| `1` … `7` | view: Gaussians / 2-sigma ellipse outlines / centers only / solid 2-sigma ellipsoids / Gaussians colored by how far off the linearized projection is (blue: exact, red: far off) / points with normal arrows (shortest axis, faded for round splats) / Gaussians evaluated per pixel ray, without the linearization (as 3DGUT) |
 | `O` | depth sorting on/off (shows why sorting matters) |
 | `H` | spherical-harmonics (view-dependent) color on/off |
 | `+` `-` | shrink / grow every splat |
 | `Z` | swap Z up (scans, point clouds) and Z front (COLMAP, -Y up) |
 | `F` | cycle the up axis: Z front (COLMAP, -Y up) / Z up / +Y up |
 | `G` | renderer: GPU, sorted on GPU (default) / GPU, sorted on CPU / CPU reference |
+| `[` `]` | the sigma of the ellipses (view 2) and ellipsoids (views 4, 5): 0.5 to 5, 2 by default |
+| `B` | flat quads: the fragment shader only fills each splat's quad with its color, to show what the vertex shader drew |
+| `C` | save all views from this camera as one picture, `views_<date>_<time>.png` in the folder the viewer was started from |
 | `R` | reset camera |
 
 ## The pipeline, as laid out in the code

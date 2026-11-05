@@ -51,7 +51,7 @@ To open another scene without restarting, drop a `.ply` or `.splat` file on the 
 | Middle drag | pan |
 | Wheel | fly speed (shown in the HUD) |
 | Hold `Shift` / `Ctrl` | fly 4x faster / slower |
-| `1` `2` `3` | view: Gaussians / 2-sigma ellipse outlines / centers only |
+| `1` … `5` | view: Gaussians / 2-sigma ellipse outlines / centers only / solid 2-sigma ellipsoids / Gaussians colored by how far off the linearized projection is (blue: exact, red: far off) |
 | `O` | depth sorting on/off (shows why sorting matters) |
 | `H` | spherical-harmonics (view-dependent) color on/off |
 | `+` `-` | shrink / grow every splat |
@@ -67,7 +67,12 @@ To open another scene without restarting, drop a `.ply` or `.splat` file on the 
 3. **3D covariance** once per splat: `Σ = R S Sᵀ Rᵀ`.
 4. **Fly camera**: position, yaw and pitch give the right/up/forward basis; pinhole projection.
 5. **Project**: `Σ' = J W Σ Wᵀ Jᵀ` plus a 0.3 px² low-pass filter. **5b**: view-dependent color from SH degrees 0–3.
-6. **Ellipse**: eigen-decomposition of the 2×2 `Σ'` gives the axes and the 1-sigma radii.
+6. **Ellipse**: eigen-decomposition of the 2×2 `Σ'` gives the axes and the 1-sigma radii. **6b**: the exact
+   outline of the 2-sigma ellipsoid under perspective, from its projected dual quadric; the linearized ellipse of
+   view 2 is off for splats that are large and close to the camera or the screen edge. **6c** (view 4): inside that
+   outline the fragment shader casts each pixel's ray at the 2-sigma ellipsoid and shades the hit, drawing every
+   splat as a solid ellipsoid. **6d** (view 5): the Hellinger distance between the linearized 2D Gaussian and the
+   exact one colors each splat, so artifacts of the linearization (smears near the camera) show up red.
 7. **Sort** back to front with a 16-bit counting sort: about 4 ms for 580k splats, where `std::sort` takes about 40 ms.
 8. **Draw** one quad per splat; the fragment shader evaluates `opacity · exp(-½|uv|²)` and alpha blending composites.
 9. **GPU renderer**: all splat data is uploaded once into four textures: position, opacity and covariance as 32-bit

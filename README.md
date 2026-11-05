@@ -45,12 +45,18 @@ To open another scene without restarting, drop a `.ply` or `.splat` file on the 
 | Input | Action |
 |---|---|
 | Drop a file on the window | open it in place of the current scene |
-| Left drag / right or middle drag / wheel | orbit / pan / zoom |
+| `W` `A` `S` `D` | fly forward / left / back / right (forward is where the camera looks) |
+| `Q` `E` | fly straight down / up |
+| Left or right drag | look around |
+| Middle drag | pan |
+| Wheel | fly speed (shown in the HUD) |
+| Hold `Shift` / `Ctrl` | fly 4x faster / slower |
 | `1` `2` `3` | view: Gaussians / 2-sigma ellipse outlines / centers only |
-| `S` | depth sorting on/off (shows why sorting matters) |
+| `O` | depth sorting on/off (shows why sorting matters) |
 | `H` | spherical-harmonics (view-dependent) color on/off |
 | `+` `-` | shrink / grow every splat |
-| `F` | flip Y (COLMAP scenes are Y-down) |
+| `Z` | swap Z up (scans, point clouds) and Z front (COLMAP, -Y up) |
+| `F` | cycle the up axis: Z front (COLMAP, -Y up) / Z up / +Y up |
 | `G` | renderer: GPU, sorted on GPU (default) / GPU, sorted on CPU / CPU reference |
 | `R` | reset camera |
 
@@ -59,7 +65,7 @@ To open another scene without restarting, drop a `.ply` or `.splat` file on the 
 1. **Splat**: position, 3 sigmas, rotation quaternion, color, opacity.
 2. **Load**: `.ply` raw values go through the training activations (`exp` scale, `sigmoid` opacity, SH DC color).
 3. **3D covariance** once per splat: `Σ = R S Sᵀ Rᵀ`.
-4. **Orbit camera**: right/up/forward basis and pinhole projection.
+4. **Fly camera**: position, yaw and pitch give the right/up/forward basis; pinhole projection.
 5. **Project**: `Σ' = J W Σ Wᵀ Jᵀ` plus a 0.3 px² low-pass filter. **5b**: view-dependent color from SH degrees 0–3.
 6. **Ellipse**: eigen-decomposition of the 2×2 `Σ'` gives the axes and the 1-sigma radii.
 7. **Sort** back to front with a 16-bit counting sort: about 4 ms for 580k splats, where `std::sort` takes about 40 ms.

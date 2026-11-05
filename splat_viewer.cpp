@@ -8,7 +8,7 @@
 //    STEP 1  What a splat is                         (struct Splat)
 //    STEP 2  Get splats: load a 3DGS .ply or .splat, or build a demo scene
 //    STEP 3  Precompute each splat's 3D covariance   Σ = R S Sᵀ Rᵀ
-//    STEP 4  Orbit camera -> view basis (right, up, forward)
+//    STEP 4  Fly camera -> view basis (right, up, forward)
 //    STEP 5  Project every splat to the screen       Σ' = J W Σ Wᵀ Jᵀ
 //    STEP 5b Color for this view: spherical harmonics (H turns them off)
 //    STEP 6  Turn the 2D covariance into an ellipse  (eigen-decomposition)
@@ -487,12 +487,12 @@ static void ComputeCovariance3D(Splat *s)
     s->cov[3] = S[1][1]; s->cov[4] = S[1][2]; s->cov[5] = S[2][2];
 }
 
-// Which way is up in the file. raylib's orbit camera keeps +Y up, so the
-// scene is turned to bring the file's up direction there. 3DGS scenes usually
-// come from COLMAP, where +Y points down; scans and most point clouds have +Z
-// up. F cycles through these.
+// Which way is up in the file. The camera (STEP 4) keeps +Y up, so the scene
+// is turned to bring the file's up direction there. 3DGS scenes usually come
+// from COLMAP, where +Y points down and +Z to the front; scans and most point
+// clouds have +Z up. Z swaps these two, F cycles through all three.
 enum UpAxis { UP_MINUS_Y = 0, UP_PLUS_Z, UP_PLUS_Y, UP_AXIS_COUNT };
-static const char *upAxisNames[] = { "-Y (COLMAP)", "+Z (scans)", "+Y" };
+static const char *upAxisNames[] = { "Z front, -Y up (COLMAP)", "Z up (scans)", "+Y up" };
 static_assert(sizeof(upAxisNames)/sizeof(upAxisNames[0]) == UP_AXIS_COUNT, "one name per up axis");
 
 // The turn that brings the file's up direction to +Y
@@ -515,17 +515,39 @@ static void TurnScene(std::vector<Splat> &splats, Quaternion turn)
 // ----------------------------------------------------------------------------
 // STEP 4: Camera
 //
-// A simple orbit camera: it sits on a sphere around `target`. From it we build
-// an orthonormal basis. Expressing a point in this basis gives its
-// camera-space coordinates:
+// A fly camera, moved like in a first-person game: it sits at `position` and
+// looks along the direction given by yaw (turning left/right, about +Y) and
+// pitch (looking up/down). From it we build an orthonormal basis. Expressing a
+// point in this basis gives its camera-space coordinates:
 //     x = how far right   y = how far up   z = depth (how far in front)
 // The three basis vectors are the rows of the view rotation W used in STEP 5.
 // ----------------------------------------------------------------------------
-struct OrbitCamera {
-    Vector3 target;
-    float distance, yaw, pitch;
-    float fovy;  // vertical field of view in radians
+#define MAX_PITCH (89.0f*DEG2RAD)  // looking straight up or down, "right" would be undefined
+
+struct FlyCamera {
+    Vector3 position;
+    float yaw, pitch;  // radians; yaw 0 and pitch 0 look along +Z
+    float fovy;        // vertical field of view in radians
+    float speed;       // how fast WASD moves, in world units per second
 };
+
+static Vector3 CameraForward(const FlyCamera *cam)
+{
+    return Vector3{ cosf(cam->pitch)*sinf(cam->yaw), sinf(cam->pitch), cosf(cam->pitch)*cosf(cam->yaw) };
+}
+
+// A camera `distance` away from `target`, looking at it. yaw and pitch give the
+// direction from the target to the camera.
+static FlyCamera CameraLookingAt(Vector3 target, float distance, float yaw, float pitch)
+{
+    FlyCamera cam;
+    cam.yaw = yaw + PI;  // the opposite direction: back at the target
+    cam.pitch = -pitch;
+    cam.position = Vector3Subtract(target, Vector3Scale(CameraForward(&cam), distance));
+    cam.fovy = 60.0f*DEG2RAD;
+    cam.speed = 0.5f*distance;  // reaches the target in 2 s
+    return cam;
+}
 
 struct ViewParams {
     Vector3 eye, right, up, forward;
@@ -534,12 +556,11 @@ struct ViewParams {
     float tanHalfFovX, tanHalfFovY;
 };
 
-static ViewParams MakeView(const OrbitCamera *cam, int width, int height)
+static ViewParams MakeView(const FlyCamera *cam, int width, int height)
 {
     ViewParams v;
-    Vector3 offset = { cosf(cam->pitch)*sinf(cam->yaw), sinf(cam->pitch), cosf(cam->pitch)*cosf(cam->yaw) };
-    v.eye = Vector3Add(cam->target, Vector3Scale(offset, cam->distance));
-    v.forward = Vector3Normalize(Vector3Subtract(cam->target, v.eye));
+    v.eye = cam->position;
+    v.forward = CameraForward(cam);
     v.right = Vector3Normalize(Vector3CrossProduct(v.forward, Vector3{ 0, 1, 0 }));
     v.up = Vector3CrossProduct(v.right, v.forward);
 
@@ -1089,7 +1110,7 @@ static bool LoadGpuRenderer(GpuRenderer *g, const std::vector<Splat> &splats, co
     return true;
 }
 
-// Splats changed on the CPU (the F flip): send the new geometry to the GPU
+// Splats changed on the CPU (a new up axis, Z or F): send the new geometry to the GPU
 // copy. The SH textures stay as they are: SH live in the file's frame.
 static void UpdateGpuGeometry(GpuRenderer *g, const std::vector<Splat> &splats)
 {
@@ -1500,17 +1521,17 @@ static float Median(std::vector<float> &values)
     return values[values.size()/2];
 }
 
-static void FrameScene(const std::vector<Splat> &splats, OrbitCamera *cam)
+static void FrameScene(const std::vector<Splat> &splats, Vector3 *center, float *distance)
 {
     std::vector<float> tmp(splats.size());
     for (size_t i = 0; i < splats.size(); i++) tmp[i] = splats[i].position.x;
-    cam->target.x = Median(tmp);
+    center->x = Median(tmp);
     for (size_t i = 0; i < splats.size(); i++) tmp[i] = splats[i].position.y;
-    cam->target.y = Median(tmp);
+    center->y = Median(tmp);
     for (size_t i = 0; i < splats.size(); i++) tmp[i] = splats[i].position.z;
-    cam->target.z = Median(tmp);
-    for (size_t i = 0; i < splats.size(); i++) tmp[i] = Vector3Distance(splats[i].position, cam->target);
-    cam->distance = fmaxf(3.0f*Median(tmp), 0.5f);
+    center->z = Median(tmp);
+    for (size_t i = 0; i < splats.size(); i++) tmp[i] = Vector3Distance(splats[i].position, *center);
+    *distance = fmaxf(3.0f*Median(tmp), 0.5f);
 }
 
 // ----------------------------------------------------------------------------
@@ -1523,7 +1544,9 @@ struct Scene {
     SphericalHarmonics sh;
     bool pointCloud = false;      // a plain point cloud .ply (STEP 2d)
     UpAxis upAxis = UP_PLUS_Y;    // the file's up direction, turned to +Y
-    OrbitCamera initialCam = {};
+    // the camera starts (and R puts it back) looking at `center` from `viewDistance` away
+    Vector3 center = { 0.0f, 1.0f, 0.0f };
+    float viewDistance = 6.5f;
     // per-frame working memory, allocated once
     std::vector<ProjectedSplat> proj;
     std::vector<int> visible, sorted;
@@ -1552,8 +1575,9 @@ static bool LoadScene(const char *path, Scene *scene)
     scene->upAxis = !path ? UP_PLUS_Y : scene->pointCloud ? UP_PLUS_Z : UP_MINUS_Y;
     if (scene->upAxis != UP_PLUS_Y) TurnScene(scene->splats, UpAxisTurn(scene->upAxis));
 
-    scene->initialCam = { .target = { 0.0f, 1.0f, 0.0f }, .distance = 6.5f, .yaw = 0.6f, .pitch = 0.35f, .fovy = 60.0f*DEG2RAD };
-    if (path) FrameScene(scene->splats, &scene->initialCam);
+    scene->center = { 0.0f, 1.0f, 0.0f };
+    scene->viewDistance = 6.5f;
+    if (path) FrameScene(scene->splats, &scene->center, &scene->viewDistance);
 
     size_t count = scene->splats.size();
     scene->proj.resize(count);
@@ -1572,6 +1596,31 @@ static void UnloadScene(Scene *scene)
 {
     if (scene->gpuSortReady) UnloadGpuSort(&scene->gpuSort);
     if (scene->gpuReady) UnloadGpuRenderer(&scene->gpu);
+}
+
+// The camera at start and after R: the scene's center, seen from a bit above and to the side
+static FlyCamera StartCamera(const Scene &scene)
+{
+    return CameraLookingAt(scene.center, scene.viewDistance, 0.6f, 0.35f);
+}
+
+// Turn the scene so that `next` becomes its up axis (Z and F). The camera keeps
+// its direction and moves so that the point it looked at is in front of it
+// again, at the same distance: the same part of the scene stays in view.
+static void SetUpAxis(Scene *scene, FlyCamera *cam, UpAxis next)
+{
+    if (next == scene->upAxis) return;
+    // undo the current turn, then make the next one
+    Quaternion turn = QuaternionMultiply(UpAxisTurn(next), QuaternionInvert(UpAxisTurn(scene->upAxis)));
+    TurnScene(scene->splats, turn);
+    scene->upAxis = next;
+    if (scene->gpuReady) UpdateGpuGeometry(&scene->gpu, scene->splats);  // keep the GPU copy in sync
+    scene->center = Vector3RotateByQuaternion(scene->center, turn);
+
+    Vector3 forward = CameraForward(cam);
+    Vector3 lookedAt = Vector3Add(cam->position, Vector3Scale(forward, scene->viewDistance));
+    lookedAt = Vector3RotateByQuaternion(lookedAt, turn);
+    cam->position = Vector3Subtract(lookedAt, Vector3Scale(forward, scene->viewDistance));
 }
 
 // ----------------------------------------------------------------------------
@@ -1623,7 +1672,8 @@ int main(int argc, char **argv)
     int modeLoc = GetShaderLocation(shader, "mode");
 
     const float DOT_SIZE = 3.0f;  // dots of the centers view, in pixels
-    OrbitCamera cam = scene.initialCam;
+    const float LOOK_SPEED = 0.004f;  // radians the camera turns per pixel of mouse drag
+    FlyCamera cam = StartCamera(scene);
     ViewMode mode = scene.pointCloud ? VIEW_CENTERS : VIEW_GAUSSIANS;
     bool sortEnabled = true;
     Renderer renderer = FirstRenderer(scene);
@@ -1650,7 +1700,7 @@ int main(int argc, char **argv)
             if (LoadScene(path.c_str(), &next)) {
                 UnloadScene(&scene);
                 scene = std::move(next);
-                cam = scene.initialCam;  // start fresh, as at launch
+                cam = StartCamera(scene);  // start fresh, as at launch
                 mode = scene.pointCloud ? VIEW_CENTERS : VIEW_GAUSSIANS;
                 renderer = FirstRenderer(scene);
                 shEnabled = (scene.sh.degree > 0);
@@ -1663,24 +1713,38 @@ int main(int argc, char **argv)
         }
         int count = (int)scene.splats.size();
 
-        // ---- input ----
+        // ---- input: the camera flies like in a first-person game ----
         Vector2 md = GetMouseDelta();
-        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
-            cam.yaw -= md.x*0.005f;
-            cam.pitch = Clamp(cam.pitch + md.y*0.005f, -1.55f, 1.55f);
+        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) || IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
+            // look around: drag right turns right, drag up looks up
+            cam.yaw -= md.x*LOOK_SPEED;
+            cam.pitch = Clamp(cam.pitch - md.y*LOOK_SPEED, -MAX_PITCH, MAX_PITCH);
         }
         ViewParams view = MakeView(&cam, GetScreenWidth(), GetScreenHeight());
-        if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT) || IsMouseButtonDown(MOUSE_BUTTON_MIDDLE)) {
-            // one pixel at the target's depth = distance / focal world units
-            float k = cam.distance/view.focal;
-            cam.target = Vector3Add(cam.target, Vector3Scale(view.right, -md.x*k));
-            cam.target = Vector3Add(cam.target, Vector3Scale(view.up, md.y*k));
+        if (IsMouseButtonDown(MOUSE_BUTTON_MIDDLE)) {
+            // pan: what is 2 s of flying ahead follows the cursor
+            float k = 2.0f*cam.speed/view.focal;
+            cam.position = Vector3Add(cam.position, Vector3Scale(view.right, -md.x*k));
+            cam.position = Vector3Add(cam.position, Vector3Scale(view.up, md.y*k));
         }
-        cam.distance *= powf(0.9f, GetMouseWheelMove());
+        cam.speed *= powf(1.25f, GetMouseWheelMove());
+        // W/S fly where the camera looks, A/D sideways, Q/E straight down/up
+        Vector3 move = Vector3Zero();
+        if (IsKeyDown(KEY_W)) move = Vector3Add(move, view.forward);
+        if (IsKeyDown(KEY_S)) move = Vector3Subtract(move, view.forward);
+        if (IsKeyDown(KEY_D)) move = Vector3Add(move, view.right);
+        if (IsKeyDown(KEY_A)) move = Vector3Subtract(move, view.right);
+        if (IsKeyDown(KEY_E)) move.y += 1.0f;
+        if (IsKeyDown(KEY_Q)) move.y -= 1.0f;
+        float step = cam.speed*fminf(GetFrameTime(), 0.1f);  // a slow frame (a file loading) does not jump far
+        if (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) step *= 4.0f;
+        if (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) step *= 0.25f;
+        cam.position = Vector3Add(cam.position, Vector3Scale(Vector3Normalize(move), step));  // diagonals no faster
+
         if (IsKeyPressed(KEY_ONE)) mode = VIEW_GAUSSIANS;
         if (IsKeyPressed(KEY_TWO)) mode = VIEW_ELLIPSES;
         if (IsKeyPressed(KEY_THREE)) mode = VIEW_CENTERS;
-        if (IsKeyPressed(KEY_S)) sortEnabled = !sortEnabled;
+        if (IsKeyPressed(KEY_O)) sortEnabled = !sortEnabled;
         if (IsKeyPressed(KEY_H) && scene.sh.degree > 0) shEnabled = !shEnabled;
         // +/- size what the view shows: the dots in the centers view, else the splats
         float grow = (IsKeyDown(KEY_EQUAL) || IsKeyDown(KEY_KP_ADD)) ? 1.02f : 1.0f;
@@ -1688,18 +1752,10 @@ int main(int argc, char **argv)
         if (mode == VIEW_CENTERS) dotSize = Clamp(dotSize*grow, 1.0f, 20.0f);
         else scaleMod = Clamp(scaleMod*grow, 0.01f, 4.0f);
         if (IsKeyPressed(KEY_G)) renderer = NextRenderer(scene, renderer);
-        if (IsKeyPressed(KEY_F)) {
-            // the next up axis: undo the current turn, then make the next one
-            UpAxis next = (UpAxis)((scene.upAxis + 1) % UP_AXIS_COUNT);
-            Quaternion turn = QuaternionMultiply(UpAxisTurn(next), QuaternionInvert(UpAxisTurn(scene.upAxis)));
-            TurnScene(scene.splats, turn);
-            scene.upAxis = next;
-            if (scene.gpuReady) UpdateGpuGeometry(&scene.gpu, scene.splats);  // keep the GPU copy in sync
-            // keep looking at the same part of the scene
-            cam.target = Vector3RotateByQuaternion(cam.target, turn);
-            scene.initialCam.target = Vector3RotateByQuaternion(scene.initialCam.target, turn);
-        }
-        if (IsKeyPressed(KEY_R)) { cam = scene.initialCam; scaleMod = 1.0f; dotSize = DOT_SIZE; }
+        // Z swaps Z up and Z front, F cycles through all the up axes
+        if (IsKeyPressed(KEY_Z)) SetUpAxis(&scene, &cam, (scene.upAxis == UP_PLUS_Z) ? UP_MINUS_Y : UP_PLUS_Z);
+        if (IsKeyPressed(KEY_F)) SetUpAxis(&scene, &cam, (UpAxis)((scene.upAxis + 1) % UP_AXIS_COUNT));
+        if (IsKeyPressed(KEY_R)) { cam = StartCamera(scene); scaleMod = 1.0f; dotSize = DOT_SIZE; }
         view = MakeView(&cam, GetScreenWidth(), GetScreenHeight());
 
         // ---- STEP 5 + 6: project every splat, STEP 5b: its color from this view ----
@@ -1762,7 +1818,7 @@ int main(int argc, char **argv)
 
         // ---- HUD ----
         static const char *modeNames[] = { "Gaussians", "Ellipses (2 sigma)", "Centers" };
-        DrawRectangle(8, 8, 380, 282, Fade(BLACK, 0.6f));
+        DrawRectangle(8, 8, 400, 322, Fade(BLACK, 0.6f));
         DrawText(TextFormat("%d FPS   %d / %d %s visible", GetFPS(), visibleCount, count,
                             scene.pointCloud ? "points" : "splats"), 16, 16, 18, RAYWHITE);
         double cpuMs[3] = { (t1 - t0)*1000.0, (t2 - t1)*1000.0, (t3 - t2)*1000.0 };
@@ -1779,7 +1835,7 @@ int main(int argc, char **argv)
         DrawText(TextFormat("[G] renderer:   %s", scene.gpuReady ? rendererNames[renderer] : "CPU (GPU unavailable)"),
                  16, 86, 16, (renderer != FirstRenderer(scene)) ? ORANGE : RAYWHITE);
         DrawText(TextFormat("[1/2/3] view:   %s", modeNames[mode]), 16, 106, 16, RAYWHITE);
-        DrawText(TextFormat("[S] sort:       %s", sortEnabled ? "on (back to front)" : "OFF (file order)"), 16, 126, 16,
+        DrawText(TextFormat("[O] sort:       %s", sortEnabled ? "on (back to front)" : "OFF (file order)"), 16, 126, 16,
                  sortEnabled ? RAYWHITE : ORANGE);
         DrawText((scene.sh.degree == 0) ? "[H] SH color:   none in file"
                  : shEnabled            ? TextFormat("[H] SH color:   on (degree %d)", scene.sh.degree)
@@ -1787,10 +1843,12 @@ int main(int argc, char **argv)
                  (scene.sh.degree > 0 && !shEnabled) ? ORANGE : RAYWHITE);
         DrawText((mode == VIEW_CENTERS) ? TextFormat("[+/-] dot size: %.1f px", dotSize)
                                         : TextFormat("[+/-] scale:    %.2fx", scaleMod), 16, 166, 16, RAYWHITE);
-        DrawText(TextFormat("[F] up axis:    %s", upAxisNames[scene.upAxis]), 16, 186, 16, RAYWHITE);
-        DrawText("[R] reset camera", 16, 206, 16, RAYWHITE);
-        DrawText("LMB orbit  RMB/MMB pan  wheel zoom", 16, 234, 16, LIGHTGRAY);
-        DrawText("F12 screenshot  Esc quit", 16, 254, 16, LIGHTGRAY);
+        DrawText(TextFormat("[Z/F] up:       %s", upAxisNames[scene.upAxis]), 16, 186, 16, RAYWHITE);
+        DrawText(TextFormat("[wheel] speed:  %.3g / s", cam.speed), 16, 206, 16, RAYWHITE);
+        DrawText("[R] reset camera", 16, 226, 16, RAYWHITE);
+        DrawText("WASD move  Q/E down/up  LMB/RMB look", 16, 254, 16, LIGHTGRAY);
+        DrawText("MMB pan  Shift fast  Ctrl slow", 16, 274, 16, LIGHTGRAY);
+        DrawText("F12 screenshot  Esc quit", 16, 294, 16, LIGHTGRAY);
         EndDrawing();
     }
 

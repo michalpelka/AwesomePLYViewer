@@ -1,8 +1,9 @@
 # Gaussian splat viewer (raylib), GPU version
 
-A minimal 3D Gaussian Splatting viewer: one C++ file, commented step by step (STEP 1–9 in `splat_viewer.cpp`).
+A minimal 3D Gaussian Splatting viewer: one C++ file, commented step by step (STEP 1–10 in `splat_viewer.cpp`).
 STEPs 1–8 run the whole render pipeline on the CPU, so it can be read and stepped through in a debugger. STEP 9
-moves the per-splat work into a vertex shader; it is the default renderer, and `G` switches back to the CPU path.
+moves the per-splat projection into a vertex shader, and STEP 10 moves culling and sorting into compute shaders, so
+the CPU does no per-splat work at all. STEP 10 is the default renderer; `G` switches to the other two.
 
 This is the faster version of the CPU-only viewer at https://gist.github.com/michalpelka/fc7d1595f439192277ad04d7be1a248a,
 which is the shorter read if you only want to learn the pipeline.
@@ -21,12 +22,17 @@ A gist cannot contain folders, so all files sit at the top level. Run the comman
 
 ## Build
 
-Needs raylib 5.5 and CMake ≥ 3.16. [happly](https://github.com/nmwsharp/happly) (PLY reader) is fetched by CMake.
+Needs CMake ≥ 3.16. CMake fetches [raylib](https://github.com/raysan5/raylib) 5.5 and
+[happly](https://github.com/nmwsharp/happly) (PLY reader), and builds raylib for OpenGL 4.3, because the GPU sort
+(STEP 10) needs its compute shaders and a usual raylib install is built for OpenGL 3.3.
 
     cmake -S . -B build && cmake --build build
 
-`CMakeLists.txt` links OpenGL/X11 explicitly because it targets a static raylib on Linux. On other setups you may
-only need `raylib`.
+On Linux, building raylib needs the X11 and OpenGL development packages, on Debian/Ubuntu:
+`sudo apt install libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libgl1-mesa-dev`.
+
+For a GPU or driver without OpenGL 4.3, configure with `-DOPENGL_VERSION=3.3`: the viewer then culls and sorts on
+the CPU. macOS gets this automatically, since its OpenGL stops at 4.1.
 
 ## Run
 
@@ -34,15 +40,18 @@ only need `raylib`.
     ./build/splat_viewer scene.ply     # standard 3DGS point_cloud.ply (with spherical harmonics)
     ./build/splat_viewer scene.splat   # compact .splat (antimatter15 web viewer format)
 
+To open another scene without restarting, drop a `.ply` or `.splat` file on the window.
+
 | Input | Action |
 |---|---|
+| Drop a file on the window | open it in place of the current scene |
 | Left drag / right or middle drag / wheel | orbit / pan / zoom |
 | `1` `2` `3` | view: Gaussians / 2-sigma ellipse outlines / centers only |
 | `S` | depth sorting on/off (shows why sorting matters) |
 | `H` | spherical-harmonics (view-dependent) color on/off |
 | `+` `-` | shrink / grow every splat |
 | `F` | flip Y (COLMAP scenes are Y-down) |
-| `G` | renderer: GPU (default) / CPU reference |
+| `G` | renderer: GPU, sorted on GPU (default) / GPU, sorted on CPU / CPU reference |
 | `R` | reset camera |
 
 ## The pipeline, as laid out in the code
@@ -55,8 +64,14 @@ only need `raylib`.
 6. **Ellipse**: eigen-decomposition of the 2×2 `Σ'` gives the axes and the 1-sigma radii.
 7. **Sort** back to front with a 16-bit counting sort: about 4 ms for 580k splats, where `std::sort` takes about 40 ms.
 8. **Draw** one quad per splat; the fragment shader evaluates `opacity · exp(-½|uv|²)` and alpha blending composites.
-9. **GPU renderer**: all splat data is uploaded once into a float texture. Per frame the CPU only culls, sorts and
-   uploads the draw order (4 bytes per splat), and one instanced draw call runs steps 5, 5b and 6 in the vertex shader.
+9. **GPU renderer**: all splat data is uploaded once into four textures: position, opacity and covariance as 32-bit
+   floats, and the SH coefficients as half floats, one texture per color channel. Per frame the CPU only culls, sorts
+   and uploads the draw order (4 bytes per splat), and one instanced draw call runs steps 5, 5b and 6 in the vertex
+   shader.
+10. **GPU cull and sort**: compute shaders cull the splats and sort them with the same 16-bit depth key as step 7,
+   using a radix sort (two passes of 8 bits). The sort is stable like the CPU one, so splats at equal depth do not
+   swap places from frame to frame. It writes the order straight into the buffer step 9 draws from; only the
+   visible count comes back to the CPU. Needs OpenGL 4.3.
 
 ## Example scenes (not included, CMake can download them)
 
@@ -74,7 +89,15 @@ Files already in `examples/` are skipped, so re-running configure does not downl
 
 ## Limits
 
-On the train scene (742k splats, 580k visible) the GPU renderer takes about 8.5 ms per frame: 4.4 ms to cull and
-3.6 ms to sort on the CPU, with the GPU work finishing within that time. The CPU reference path takes about 68 ms. What remains is
-CPU culling and sorting, single-threaded. The splat texture takes 304 bytes per splat in GPU memory (about 225 MB
-for the train scene). Compressed formats (`.spz`, compressed `.ply`) are not supported.
+Measured on an RTX 4080, without vsync. On the train scene (742k splats) a frame takes about 1.6 ms with the GPU
+sort: 0.4 ms to cull and sort and about 1 ms to draw, both on the GPU. With the CPU sort it takes about 8.5 ms
+(4.4 ms to cull and 3.6 ms to sort, single-threaded), and the CPU reference path takes about 68 ms.
+
+The splat textures take 144 bytes per splat in GPU memory with SH degree 3 (about 100 MB for the train scene, 72 bytes
+per splat without SH), and the GPU sort adds 12 bytes per splat. The textures hold up to 67M splats with SH degree 3
+and 89M without; larger scenes fall back to the CPU renderer.
+
+The train scene tiled 25 times (18.5M splats, a 4.6 GB `.ply`) loads in 14 s and needs 10.5 GB of RAM while loading
+and 2.8 GB of GPU memory. With the GPU sort it runs at about 12 FPS: 10–12 ms to cull and sort, and about 75 ms to
+draw 18.4M overlapping splats, so the draw itself is now the limit. With the CPU sort it runs at about 4 FPS, as
+culling and sorting take about 100 ms each. Compressed formats (`.spz`, compressed `.ply`) are not supported.

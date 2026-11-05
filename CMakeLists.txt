@@ -7,11 +7,29 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-find_package(raylib 5.5 REQUIRED)
+include(FetchContent)
+if(POLICY CMP0135)
+    cmake_policy(SET CMP0135 NEW)  # downloaded files get the extraction time, so a new download rebuilds them
+endif()
+
+# raylib 5.5, built from source for OpenGL 4.3: the GPU sort (STEP 10) needs its compute shaders, and the usual
+# raylib build is for OpenGL 3.3. macOS stops at OpenGL 4.1, so there raylib is built for 3.3 and the viewer sorts
+# on the CPU. -DOPENGL_VERSION=3.3 does the same for a GPU or driver without OpenGL 4.3.
+if(APPLE)
+    set(OPENGL_VERSION "3.3" CACHE STRING "OpenGL version raylib is built for")
+else()
+    set(OPENGL_VERSION "4.3" CACHE STRING "OpenGL version raylib is built for (4.3 enables the GPU sort)")
+endif()
+FetchContent_Declare(raylib
+    URL      https://github.com/raysan5/raylib/archive/refs/tags/5.5.tar.gz
+    URL_HASH SHA256=aea98ecf5bc5c5e0b789a76de0083a21a70457050ea4cc2aec7566935f5e258e)
+FetchContent_MakeAvailable(raylib)
+# Treat raylib's headers as system headers, as an installed raylib's would be, so warnings in them stay quiet.
+get_target_property(raylib_includes raylib INTERFACE_INCLUDE_DIRECTORIES)
+set_target_properties(raylib PROPERTIES INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${raylib_includes}")
 
 # happly: header-only PLY reader/writer (MIT), https://github.com/nmwsharp/happly
 # The repo has no CMakeLists.txt, so FetchContent just downloads it and we add its folder to the include path.
-include(FetchContent)
 FetchContent_Declare(happly
     GIT_REPOSITORY https://github.com/nmwsharp/happly.git
     GIT_TAG        ed5480454d15e5287370eadc3682e9d40ba395e1)
@@ -20,13 +38,6 @@ FetchContent_MakeAvailable(happly)
 add_executable(splat_viewer splat_viewer.cpp)
 target_include_directories(splat_viewer PRIVATE ${happly_SOURCE_DIR})
 target_link_libraries(splat_viewer PRIVATE raylib m)
-
-# The installed raylib is a static library, so its own dependencies have to be linked here.
-if(UNIX AND NOT APPLE)
-    find_package(OpenGL REQUIRED)
-    find_package(X11 REQUIRED)
-    target_link_libraries(splat_viewer PRIVATE OpenGL::GL ${X11_LIBRARIES} pthread dl rt)
-endif()
 
 # Optional example scenes (~200 MB), downloaded into examples/ at configure time:
 #     cmake -S . -B build -DSPLAT_VIEWER_EXAMPLES=ON

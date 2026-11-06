@@ -24,6 +24,9 @@ FetchContent_Declare(raylib
     URL      https://github.com/raysan5/raylib/archive/refs/tags/5.5.tar.gz
     URL_HASH SHA256=aea98ecf5bc5c5e0b789a76de0083a21a70457050ea4cc2aec7566935f5e258e)
 FetchContent_MakeAvailable(raylib)
+# Leave raylib's install rules (static library, headers, pkg-config and CMake package files) out of
+# `cmake --install`: the viewer links raylib statically, so only the executable needs installing.
+set_property(DIRECTORY "${raylib_SOURCE_DIR}" PROPERTY EXCLUDE_FROM_ALL ON)
 # Treat raylib's headers as system headers, as an installed raylib's would be, so warnings in them stay quiet.
 get_target_property(raylib_includes raylib INTERFACE_INCLUDE_DIRECTORIES)
 set_target_properties(raylib PROPERTIES INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${raylib_includes}")
@@ -35,9 +38,32 @@ FetchContent_Declare(happly
     GIT_TAG        ed5480454d15e5287370eadc3682e9d40ba395e1)
 FetchContent_MakeAvailable(happly)
 
-add_executable(splat_viewer splat_viewer.cpp)
+add_executable(splat_viewer splat_viewer.cpp camera_link.cpp)
 target_include_directories(splat_viewer PRIVATE ${happly_SOURCE_DIR})
 target_link_libraries(splat_viewer PRIVATE raylib m)
+
+# Camera link (camera_link.h): viewers open on one computer share their camera over ZeroMQ. It uses the
+# system's libzmq (Debian/Ubuntu: libzmq3-dev, macOS: brew install zeromq); without it the viewer is built
+# without the link.
+option(SPLAT_VIEWER_LINK "Share the camera between viewers on one computer (needs libzmq)" ON)
+if(SPLAT_VIEWER_LINK)
+    find_package(PkgConfig QUIET)
+    if(PKG_CONFIG_FOUND)
+        pkg_check_modules(ZMQ QUIET IMPORTED_TARGET libzmq)
+    endif()
+    if(ZMQ_FOUND)
+        message(STATUS "Camera link: on (libzmq ${ZMQ_VERSION})")
+        target_link_libraries(splat_viewer PRIVATE PkgConfig::ZMQ)
+        target_compile_definitions(splat_viewer PRIVATE CAMERA_LINK_ZMQ)
+    else()
+        message(STATUS "Camera link: off, libzmq not found")
+    endif()
+endif()
+
+# cmake --install build [--prefix <dir>] puts splat_viewer in <prefix>/bin. The shaders are compiled into the
+# executable, so it is the only file installed.
+include(GNUInstallDirs)
+install(TARGETS splat_viewer RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # Optional example scenes (~200 MB), downloaded into examples/ at configure time:
 #     cmake -S . -B build -DSPLAT_VIEWER_EXAMPLES=ON

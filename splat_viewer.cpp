@@ -30,7 +30,11 @@
 //  Usage:  ./splat_viewer              -> procedural demo scene
 //          ./splat_viewer scene.ply    -> standard 3DGS output .ply (read with happly)
 //          ./splat_viewer scene.splat  -> compact .splat (web viewer format)
-//  A .ply or .splat dropped on the window replaces the scene.
+//          ./splat_viewer a.ply b.ply  -> one linked viewer per file
+//  Viewers open on one computer share their camera and view (camera_link.h); L
+//  unlinks one, M lets it pick views of its own.
+//  A .ply or .splat dropped on the window replaces the demo scene; on a linked
+//  viewer that already shows a file, it opens in a new viewer flying with it.
 // ============================================================================
 
 #include "raylib.h"
@@ -40,14 +44,23 @@
 
 #include "happly.h"
 
+#include "camera_link.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <string>
 #include <vector>
+
+#ifndef _WIN32
+#include <spawn.h>  // posix_spawn: a dropped file opens in a new viewer
+#include <sys/wait.h>
+extern char **environ;
+#endif
 
 // ----------------------------------------------------------------------------
 // STEP 1: What a splat is
@@ -2069,6 +2082,7 @@ static void FrameScene(const std::vector<Splat> &splats, Vector3 *center, float 
 // ----------------------------------------------------------------------------
 struct Scene {
     std::string name;  // file name, shown in the HUD
+    bool demo = false;  // the demo scene (STEP 2c), not a file
     std::vector<Splat> splats;
     SphericalHarmonics sh;
     bool pointCloud = false;      // a plain point cloud .ply (STEP 2d)
@@ -2097,11 +2111,13 @@ static bool LoadScene(const char *path, Scene *scene)
     else scene->splats = LoadSplatsFromPly(path, &scene->sh, &scene->pointCloud);
     if (scene->splats.empty()) return false;
     scene->name = path ? GetFileName(path) : "demo scene";
+    scene->demo = !path;
 
     // STEP 3: covariance once per splat
     for (Splat &s : scene->splats) ComputeCovariance3D(&s);
-    // The demo is built +Y up; splat files are usually COLMAP's -Y, point clouds +Z.
-    scene->upAxis = !path ? UP_PLUS_Y : scene->pointCloud ? UP_PLUS_Z : UP_MINUS_Y;
+    // The demo is built +Y up; files are taken as Z up, as scans and maps are.
+    // Z turns a COLMAP scene (-Y up) the right way up.
+    scene->upAxis = !path ? UP_PLUS_Y : UP_PLUS_Z;
     if (scene->upAxis != UP_PLUS_Y) TurnScene(scene->splats, UpAxisTurn(scene->upAxis));
 
     scene->center = { 0.0f, 1.0f, 0.0f };
@@ -2150,6 +2166,98 @@ static void SetUpAxis(Scene *scene, FlyCamera *cam, UpAxis next)
     Vector3 lookedAt = Vector3Add(cam->position, Vector3Scale(forward, scene->viewDistance));
     lookedAt = Vector3RotateByQuaternion(lookedAt, turn);
     cam->position = Vector3Subtract(lookedAt, Vector3Scale(forward, scene->viewDistance));
+}
+
+// ----------------------------------------------------------------------------
+// The camera linked viewers share (camera_link.h) is in the file's coordinates,
+// before the up-axis turn: viewers that turned the same file differently still
+// see the same part of it, from the same place.
+// ----------------------------------------------------------------------------
+static LinkedCamera ToLinkedCamera(const FlyCamera &cam, UpAxis up)
+{
+    Quaternion unturn = QuaternionInvert(UpAxisTurn(up));
+    Vector3 p = Vector3RotateByQuaternion(cam.position, unturn);
+    Vector3 f = Vector3RotateByQuaternion(CameraForward(&cam), unturn);
+    return LinkedCamera{ { p.x, p.y, p.z }, { f.x, f.y, f.z }, cam.fovy, cam.speed };
+}
+
+// Back into this viewer's turned scene. The fly camera cannot roll, so a viewer
+// with another up axis sees the same view, rolled about its center.
+static FlyCamera FromLinkedCamera(const LinkedCamera &linked, UpAxis up)
+{
+    Quaternion turn = UpAxisTurn(up);
+    Vector3 p = { linked.position[0], linked.position[1], linked.position[2] };
+    Vector3 f = { linked.forward[0], linked.forward[1], linked.forward[2] };
+    f = Vector3Normalize(Vector3RotateByQuaternion(f, turn));
+    FlyCamera cam;
+    cam.position = Vector3RotateByQuaternion(p, turn);
+    cam.yaw = atan2f(f.x, f.z);  // the inverse of CameraForward()
+    cam.pitch = Clamp(asinf(Clamp(f.y, -1.0f, 1.0f)), -MAX_PITCH, MAX_PITCH);
+    cam.fovy = linked.fovy;
+    cam.speed = linked.speed;
+    return cam;
+}
+
+// The view to follow: the one a linked viewer picked last (1-7), if this viewer
+// syncs views (M). -1 if there is none.
+static int LinkedViewMode(const CameraLink *link, bool syncView, const LinkedState &shared)
+{
+    if (!link || !syncView || shared.viewMode < 0 || shared.viewMode >= VIEW_MODE_COUNT) return -1;
+    return shared.viewMode;
+}
+
+// ----------------------------------------------------------------------------
+// A new viewer for a dropped file: this program again, in a process and window
+// of its own, with the file as its argument. It joins the camera link as it
+// starts, so it opens at the camera the others have. Not fork() alone: the copy
+// would share this viewer's window and OpenGL context, so it runs (exec) the
+// program afresh; posix_spawn does both.
+// ----------------------------------------------------------------------------
+static bool OpenInNewViewer(const char *argv0, const char *path)
+{
+#ifdef _WIN32
+    (void)argv0; (void)path;
+    return false;
+#else
+#ifdef __linux__
+    std::string exe = "/proc/self/exe";  // this program, however it was started
+#else
+    std::string exe = std::string(GetApplicationDirectory()) + GetFileName(argv0);
+#endif
+    char *args[] = { const_cast<char *>(argv0), const_cast<char *>(path), NULL };
+    pid_t pid;
+    return posix_spawn(&pid, exe.c_str(), NULL, NULL, args, environ) == 0;
+#endif
+}
+
+// Collects the viewers this one started that have quit, so none lingers as a zombie process.
+static void ReapNewViewers()
+{
+#ifndef _WIN32
+    while (waitpid(-1, NULL, WNOHANG) > 0) {}
+#endif
+}
+
+// The window title names the file and its folder, to tell linked viewers apart: 3DGS
+// training writes every iteration to a point_cloud.ply, in a folder of its own. The
+// folder goes first, as a taskbar cuts long titles at the end. path NULL = the demo scene.
+static std::string WindowTitle(const char *path)
+{
+    if (!path) return "Gaussian splat viewer";
+    // absolute and normalized, so "scene.ply" and "../x/scene.ply" name their folder too
+    std::error_code error;
+    std::string folder = std::filesystem::absolute(path, error).lexically_normal().parent_path().filename().string();
+    if (error) folder.clear();
+    return (folder.empty() ? "" : folder + "/") + GetFileName(path) + " - Gaussian splat viewer";
+}
+
+// A big file takes seconds to load, so say so on screen first.
+static void DrawLoadingScreen(const char *path)
+{
+    BeginDrawing();
+    ClearBackground(Color{ 20, 20, 26, 255 });
+    DrawText(TextFormat("Loading %s ...", GetFileName(path)), 16, 16, 20, RAYWHITE);
+    EndDrawing();
 }
 
 // ----------------------------------------------------------------------------
@@ -2331,11 +2439,30 @@ static std::string CaptureAllViews(Scene &scene, const ViewParams &view, Vector2
 // ----------------------------------------------------------------------------
 int main(int argc, char **argv)
 {
+    const char *path = (argc > 1) ? argv[1] : NULL;
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
-    InitWindow(1280, 800, "Gaussian splat viewer");
+    // Created with the plain title, then renamed: on X11 the first title also becomes the
+    // window's class, which the taskbar groups windows by, so every viewer keeps one class.
+    InitWindow(1280, 800, WindowTitle(NULL).c_str());
+    SetWindowTitle(WindowTitle(path).c_str());
+
+    // Join the camera link first: a viewer that joins connects while its scene loads,
+    // and so has the others' camera from its first frame.
+    bool linkOn = true;                    // L: share the camera with the other viewers on this computer
+    bool syncView = true;                  // M: and the view picked with 1-7
+    CameraLink *link = OpenCameraLink();   // NULL when built without ZeroMQ
+    LinkedState shared = { {}, -1 };       // what the link shares, as of this frame
+
+    // Several files on the command line: this viewer opens the first, and every other one
+    // opens in a new viewer, linked to this one. Started now, they all load at once.
+    for (int i = 2; i < argc; i++) {
+        if (!IsFileExtension(argv[i], ".ply;.splat")) TraceLog(LOG_WARNING, "Not a .ply or .splat: %s", argv[i]);
+        else if (!OpenInNewViewer(argv[0], argv[i])) TraceLog(LOG_WARNING, "Could not start a viewer for %s", argv[i]);
+    }
 
     Scene scene;
-    if (!LoadScene((argc > 1) ? argv[1] : NULL, &scene)) { CloseWindow(); return 1; }
+    if (path) DrawLoadingScreen(path);
+    if (!LoadScene(path, &scene)) { CloseCameraLink(link); CloseWindow(); return 1; }
     std::string dropFailed;  // name of the last dropped file, if it could not be loaded
 
     std::vector<unsigned int> buckets(SORT_BUCKETS);  // sort working memory, the same for every scene
@@ -2350,42 +2477,64 @@ int main(int argc, char **argv)
     bool flatQuads = false;  // B: show the quads the vertex shader draws, filled flat
     const float DRAW_SIGMA = 2.0f;
     float drawSigma = DRAW_SIGMA;  // [ and ]: the k of the k-sigma ellipses and ellipsoids of views 2, 4, 5
-    std::string captureMessage;    // C: what the last capture of all views did, shown for a few seconds
-    double captureTime = -100.0;
+    std::string notice;            // what C or a drop did, shown for a few seconds
+    double noticeTime = -100.0;
     Renderer renderer = FirstRenderer(scene);
     bool shEnabled = (scene.sh.degree > 0);
     float scaleMod = 1.0f;
     float dotSize = DOT_SIZE;
 
     while (!WindowShouldClose()) {
-        // ---- drag and drop: a .ply or .splat dropped on the window replaces the scene ----
+        ReapNewViewers();
+
+        // ---- link: take the camera another viewer moved, and the view it picked if this
+        // viewer syncs views (M). Then note where the camera is, to tell after input
+        // whether this viewer moved it (R and a dropped file too) ----
+        int changed = ReceiveLinked(link, &shared);
+        if (changed & LINKED_CAMERA) cam = FromLinkedCamera(shared.camera, scene.upAxis);
+        int linkedView = LinkedViewMode(link, syncView, shared);
+        if ((changed & LINKED_VIEW_MODE) && linkedView >= 0) mode = (ViewMode)linkedView;
+        LinkedCamera camBefore = ToLinkedCamera(cam, scene.upAxis);
+
+        // ---- drag and drop: a .ply or .splat dropped on the window opens it. The demo
+        // scene, or a viewer whose camera is not linked (L), loads the file in its place.
+        // A linked viewer that already shows a file opens it in a new viewer instead,
+        // which takes the shared camera: the two then fly together. Of several files
+        // dropped at once, the second and later always open in new viewers. ----
         if (IsFileDropped()) {
             FilePathList dropped = LoadDroppedFiles();
-            std::string path = dropped.paths[0];  // of several files, only the first
+            std::vector<std::string> paths(dropped.paths, dropped.paths + dropped.count);
             UnloadDroppedFiles(dropped);
-
-            // A big file takes seconds to load, so say so on screen first.
-            BeginDrawing();
-            ClearBackground(Color{ 20, 20, 26, 255 });
-            DrawText(TextFormat("Loading %s ...", GetFileName(path.c_str())), 16, 16, 20, RAYWHITE);
-            EndDrawing();
-
-            // Load it next to the current scene, so a file that fails to load
-            // leaves the current one on screen.
-            Scene next;
-            if (LoadScene(path.c_str(), &next)) {
+            for (size_t i = 0; i < paths.size(); i++) {
+                const char *name = GetFileName(paths[i].c_str());
+                if (i > 0 || (link && !scene.demo)) {
+                    if (!IsFileExtension(name, ".ply;.splat")) { dropFailed = name; continue; }
+                    notice = OpenInNewViewer(argv[0], paths[i].c_str())
+                                 ? TextFormat("Opened %s in a new viewer", name)
+                                 : TextFormat("Could not start a new viewer for %s", name);
+                    noticeTime = GetTime();
+                    continue;
+                }
+                DrawLoadingScreen(paths[i].c_str());
+                // Load it next to the current scene, so a file that fails to load
+                // leaves the current one on screen.
+                Scene next;
+                if (!LoadScene(paths[i].c_str(), &next)) {
+                    dropFailed = name;
+                    continue;
+                }
                 UnloadScene(&scene);
                 scene = std::move(next);
                 cam = StartCamera(scene);  // start fresh, as at launch
-                mode = scene.pointCloud ? VIEW_CENTERS : VIEW_GAUSSIANS;
+                // the view the linked viewers have, if this one syncs views
+                mode = (linkedView >= 0) ? (ViewMode)linkedView : scene.pointCloud ? VIEW_CENTERS : VIEW_GAUSSIANS;
                 renderer = FirstRenderer(scene);
                 shEnabled = (scene.sh.degree > 0);
                 scaleMod = 1.0f;
                 dotSize = DOT_SIZE;
                 drawSigma = DRAW_SIGMA;
                 dropFailed.clear();
-            } else {
-                dropFailed = GetFileName(path.c_str());
+                SetWindowTitle(WindowTitle(paths[i].c_str()).c_str());
             }
         }
         int count = (int)scene.splats.size();
@@ -2418,13 +2567,16 @@ int main(int argc, char **argv)
         if (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) step *= 0.25f;
         cam.position = Vector3Add(cam.position, Vector3Scale(Vector3Normalize(move), step));  // diagonals no faster
 
-        if (IsKeyPressed(KEY_ONE)) mode = VIEW_GAUSSIANS;
-        if (IsKeyPressed(KEY_TWO)) mode = VIEW_ELLIPSES;
-        if (IsKeyPressed(KEY_THREE)) mode = VIEW_CENTERS;
-        if (IsKeyPressed(KEY_FOUR)) mode = VIEW_ELLIPSOIDS;
-        if (IsKeyPressed(KEY_FIVE)) mode = VIEW_LINEARIZATION_ERROR;
-        if (IsKeyPressed(KEY_SIX)) mode = VIEW_NORMALS;
-        if (IsKeyPressed(KEY_SEVEN)) mode = VIEW_PER_RAY;
+        // A pick goes to synced viewers even if this one shows that view already: theirs may differ.
+        int picked = -1;
+        if (IsKeyPressed(KEY_ONE)) picked = VIEW_GAUSSIANS;
+        if (IsKeyPressed(KEY_TWO)) picked = VIEW_ELLIPSES;
+        if (IsKeyPressed(KEY_THREE)) picked = VIEW_CENTERS;
+        if (IsKeyPressed(KEY_FOUR)) picked = VIEW_ELLIPSOIDS;
+        if (IsKeyPressed(KEY_FIVE)) picked = VIEW_LINEARIZATION_ERROR;
+        if (IsKeyPressed(KEY_SIX)) picked = VIEW_NORMALS;
+        if (IsKeyPressed(KEY_SEVEN)) picked = VIEW_PER_RAY;
+        if (picked >= 0) mode = (ViewMode)picked;
         if (IsKeyPressed(KEY_O)) sortEnabled = !sortEnabled;
         if (IsKeyPressed(KEY_B)) flatQuads = !flatQuads;
         if (IsKeyPressed(KEY_RIGHT_BRACKET)) drawSigma = fminf(drawSigma + 0.5f, 5.0f);
@@ -2445,13 +2597,29 @@ int main(int argc, char **argv)
             dotSize = DOT_SIZE;
             drawSigma = DRAW_SIGMA;
         }
+        if (IsKeyPressed(KEY_L)) {
+            linkOn = !linkOn;
+            CloseCameraLink(link);
+            link = linkOn ? OpenCameraLink() : NULL;  // a viewer linked again takes the others' camera and view
+        }
+        if (IsKeyPressed(KEY_M)) {
+            syncView = !syncView;
+            int last = LinkedViewMode(link, syncView, shared);  // synced again: take the view picked last
+            if (last >= 0) mode = (ViewMode)last;
+        }
+        // compared in the file's coordinates, so turning the scene (Z, F) counts as a move too
+        LinkedCamera camAfter = ToLinkedCamera(cam, scene.upAxis);
+        int changedHere = 0;
+        if (memcmp(&camBefore, &camAfter, sizeof camAfter) != 0) changedHere |= LINKED_CAMERA;
+        if (picked >= 0 && syncView) changedHere |= LINKED_VIEW_MODE;
+        SendLinked(link, LinkedState{ camAfter, mode }, changedHere);
         view = MakeView(&cam, GetScreenWidth(), GetScreenHeight());
 
         RenderOptions options = { mode, renderer, sortEnabled, shEnabled, flatQuads, scaleMod, dotSize, drawSigma };
         Vector2 screen = { (float)GetScreenWidth(), (float)GetScreenHeight() };
         if (IsKeyPressed(KEY_C)) {  // every view from here, in one picture
-            captureMessage = CaptureAllViews(scene, view, screen, options, buckets, shader, modeLoc);
-            captureTime = GetTime();
+            notice = CaptureAllViews(scene, view, screen, options, buckets, shader, modeLoc);
+            noticeTime = GetTime();
         }
 
         BeginDrawing();
@@ -2459,7 +2627,7 @@ int main(int argc, char **argv)
         RenderStats stats = RenderSplats(scene, view, screen, options, buckets, shader, modeLoc);
 
         // ---- HUD ----
-        DrawRectangle(8, 8, 400, 362, Fade(BLACK, 0.6f));
+        DrawRectangle(8, 8, 400, 382, Fade(BLACK, 0.6f));
         DrawText(TextFormat("%d FPS   %d / %d %s visible", GetFPS(), stats.visible, count,
                             scene.pointCloud ? "points" : "splats"), 16, 16, 18, RAYWHITE);
         double cpuMs[3] = { stats.projectMs, stats.sortMs, stats.drawMs };
@@ -2491,24 +2659,30 @@ int main(int argc, char **argv)
         DrawText(TextFormat("[ ] sigma:      %.1f (views 2, 4, 5)", drawSigma), 16, 246, 16,
                  (drawSigma != DRAW_SIGMA) ? ORANGE : RAYWHITE);
         DrawText("[R] reset camera", 16, 266, 16, RAYWHITE);
-        DrawText("WASD move  Q/E down/up  LMB/RMB look", 16, 294, 16, LIGHTGRAY);
-        DrawText("MMB pan  Shift fast  Ctrl slow", 16, 314, 16, LIGHTGRAY);
-        DrawText("C all views  F12 screenshot  Esc quit", 16, 334, 16, LIGHTGRAY);
-        if (GetTime() - captureTime < 4.0) {
-            int width = MeasureText(captureMessage.c_str(), 18) + 16;
+        DrawText(!linkOn ? "[L/M] link:     OFF (nothing shared)"
+                 : !link ? "[L/M] link:     none (built without ZeroMQ)"
+                         : TextFormat("[L/M] link:     %s (%s)", syncView ? "camera + view" : "camera only",
+                                      CameraLinkRole(link)), 16, 286, 16,
+                 (link && syncView) ? RAYWHITE : ORANGE);
+        DrawText("WASD move  Q/E down/up  LMB/RMB look", 16, 314, 16, LIGHTGRAY);
+        DrawText("MMB pan  Shift fast  Ctrl slow", 16, 334, 16, LIGHTGRAY);
+        DrawText("C all views  F12 screenshot  Esc quit", 16, 354, 16, LIGHTGRAY);
+        if (GetTime() - noticeTime < 4.0) {
+            int width = MeasureText(notice.c_str(), 18) + 16;
             DrawRectangle(8, GetScreenHeight() - 40, width, 32, Fade(BLACK, 0.6f));
-            DrawText(captureMessage.c_str(), 16, GetScreenHeight() - 33, 18, RAYWHITE);
+            DrawText(notice.c_str(), 16, GetScreenHeight() - 33, 18, RAYWHITE);
         }
         if (mode == VIEW_LINEARIZATION_ERROR) {
             // the color scale of view 5 (STEP 6d): Hellinger distance, linearized vs exact
-            DrawRectangle(8, 374, 400, 30, Fade(BLACK, 0.6f));
-            DrawText("exact", 16, 381, 16, RAYWHITE);
-            for (int x = 0; x < 240; x++) DrawRectangle(70 + x, 382, 1, 14, RampColor(x/239.0f));
-            DrawText(TextFormat(">= %.1f off", LINEARIZATION_RED), 318, 381, 16, RAYWHITE);
+            DrawRectangle(8, 394, 400, 30, Fade(BLACK, 0.6f));
+            DrawText("exact", 16, 401, 16, RAYWHITE);
+            for (int x = 0; x < 240; x++) DrawRectangle(70 + x, 402, 1, 14, RampColor(x/239.0f));
+            DrawText(TextFormat(">= %.1f off", LINEARIZATION_RED), 318, 401, 16, RAYWHITE);
         }
         EndDrawing();
     }
 
+    CloseCameraLink(link);
     UnloadScene(&scene);
     UnloadShader(shader);
     CloseWindow();

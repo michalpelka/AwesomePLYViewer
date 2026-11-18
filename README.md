@@ -50,6 +50,8 @@ the CPU. macOS gets this automatically, since its OpenGL stops at 4.1.
     ./build/splat_viewer scene.splat   # compact .splat (antimatter15 web viewer format)
     ./build/splat_viewer a.ply b.ply   # one viewer per file, flying together (below)
     ./build/splat_viewer scene.ply mesh.obj   # the splats with a mesh (below)
+    ./build/splat_viewer --serve scene.ply    # in web browsers too, at http://<this computer>:8080/ (below)
+    ./build/splat_viewer --serve --headless scene.ply   # only there: no window, no display needed (below)
 
 To open a scene without restarting, drop a `.ply` or `.splat` file on the window.
 
@@ -112,6 +114,53 @@ picked last.
 | `L` | link the camera and view with the other viewers on this computer on/off (on by default) |
 | `M` | share the view (`1` … `7`) with the linked viewers on/off (on by default); the camera stays linked |
 
+### In a web browser
+
+`--serve` streams the viewer to web browsers, so someone without the GPU, or without the file, can fly through the
+scene from their own computer:
+
+    ./build/splat_viewer --serve scene.ply          # port 8080
+    ./build/splat_viewer --serve=9000 scene.ply     # another port
+
+The viewer prints the addresses to open, `http://<this computer>:8080/`, and shows the first one in its window. It
+renders on this computer's GPU, at the size of the browser's window, and sends each frame as a JPEG over a
+WebSocket; the browser sends its keys, mouse and wheel back, and the viewer plays them into raylib as if they came
+from its own window. Only pictures travel, so the browser needs neither a GPU nor the file, and the port opens before
+the file has loaded: a browser that comes early gets the first picture when it is ready. The window keeps working
+and shows what the browsers see. Several browsers can watch, and fly, at once; the one that joined or resized last
+sets the frame size.
+
+In the browser the keys are the window's, but for `Space`, which flies slowly in place of `Ctrl` (Ctrl+W would close
+the tab); `Esc` and `F12` stay with the viewer's computer. A camera that stands still sends nothing new but the HUD's
+numbers, once a second. A moving one sends 50–120 KB a frame at 1280 × 720, up to about 50 Mbit/s: on a slow link,
+add `?res=0.5` to the address for frames at half the browser window's size (a quarter of the pixels), or `?res=2` for
+a sharp picture on a HiDPI screen.
+
+There is no password: whoever can reach the port can watch and fly. Serve on a network you trust. If a firewall
+blocks the port, an SSH tunnel gets through: `ssh -L 8080:localhost:8080 <this computer>`, then open
+http://localhost:8080/. Linux and macOS only (POSIX sockets).
+
+### Headless
+
+Over SSH, or on a server with no desktop, there is no display to open a window on. With `--serve` the viewer then
+renders headless: on the GPU all the same, through EGL, with no window anywhere (STEP 12b, Linux).
+
+    ssh gpu-computer
+    splat_viewer --serve scene.ply              # no display here: headless by itself
+    splat_viewer --serve --headless scene.ply   # headless even with a display: no window on the desktop
+
+It says `Headless: OpenGL 4.3 through EGL, without a display`, and raylib's log names the GPU. Building it needs
+libEGL (Debian/Ubuntu: `libegl-dev`); CMake reports `Headless: on (EGL)`. For a window on the computer's desktop
+instead, from an SSH session: `DISPLAY=:1 splat_viewer --serve scene.ply` (`echo $DISPLAY` in a terminal on the
+desktop gives the number). `xvfb-run` would give a display too, but renders on the CPU: about 10 s a frame for 11M
+splats.
+
+Measured headless on an RTX 4080, at 1280 × 720: the demo scene streams at 60 FPS, the frame-rate cap. A scan of
+11.25M splats with SH degree 3 (a 2.65 GB `.ply`) shows its first frame 10 s after the start, streams at about
+10 FPS with the whole scan in view and 20–27 FPS from inside it, at about 65 KB a frame, and takes 6.3 GB of RAM and
+1.8 GB of GPU memory. Those 10 FPS are the renderer's: the same at 640 × 360 as at 1920 × 1080, so drawing 11M
+overlapping splats, not the stream, sets them.
+
 ## The pipeline, as laid out in the code
 
 1. **Splat**: position, 3 sigmas, rotation quaternion, color, opacity.
@@ -139,6 +188,15 @@ picked last.
    tested against it at the depth of its center (view 4: where the pixel's ray hits the ellipsoid), and writes no
    depth itself, as the sort orders the splats among themselves. **11a**: `.ply` meshes, cut into chunks of 65536
    vertices for raylib's 16-bit indices.
+12. **Web stream** (`--serve`, `web_stream.cpp`): each frame renders into a texture the size of the browser's window,
+   which `glReadPixels` reads back. A thread of its own compares it with the last frame sent (a camera that stands
+   still sends nothing), encodes it as a JPEG with raylib's copy of stb_image_write (about 6 ms at 1280 × 720) and
+   sends it over a WebSocket, which it serves with the page itself from a small HTTP server: no dependencies. A
+   browser has at most two frames on their way, so a slow connection gets fewer frames rather than late ones. The
+   browser's input comes back over the same socket and goes into raylib with `PlayAutomationEvent()`, so the input
+   code of the main loop does not know a browser is there. **12b** (`headless.cpp`): with no display, the OpenGL
+   context comes from EGL, which needs none, and GLFW runs its null platform. raylib is not changed: the linker
+   redirects the six GLFW calls that pick the platform and make the context (`--wrap`) to `headless.cpp`.
 
 ## Example scenes (not included, CMake can download them)
 

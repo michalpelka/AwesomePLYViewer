@@ -38,9 +38,30 @@ FetchContent_Declare(happly
     GIT_TAG        ed5480454d15e5287370eadc3682e9d40ba395e1)
 FetchContent_MakeAvailable(happly)
 
-add_executable(splat_viewer splat_viewer.cpp camera_link.cpp)
+# web_stream.cpp: --serve streams the viewer to web browsers (STEP 12) on a thread of its own. It needs
+# nothing beyond POSIX sockets and raylib's copy of stb_image_write.
+find_package(Threads REQUIRED)
+add_executable(splat_viewer splat_viewer.cpp camera_link.cpp web_stream.cpp headless.cpp)
 target_include_directories(splat_viewer PRIVATE ${happly_SOURCE_DIR})
-target_link_libraries(splat_viewer PRIVATE raylib m)
+target_link_libraries(splat_viewer PRIVATE raylib m Threads::Threads)
+
+# Headless (headless.cpp, STEP 12b): --serve on a computer with no display renders on the GPU all the same,
+# through EGL. The six GLFW calls that pick GLFW's platform and make raylib's OpenGL context are redirected
+# by the linker (--wrap) to headless.cpp, which hands them on to GLFW unless the viewer runs headless. Linux,
+# with libEGL (Debian/Ubuntu: libegl-dev); without it, the viewer needs a display, as before.
+if(UNIX AND NOT APPLE)
+    find_package(OpenGL QUIET COMPONENTS EGL)
+    if(OpenGL_EGL_FOUND)
+        message(STATUS "Headless: on (EGL)")
+        target_link_libraries(splat_viewer PRIVATE OpenGL::EGL)
+        target_compile_definitions(splat_viewer PRIVATE SPLAT_VIEWER_HEADLESS)
+        target_link_options(splat_viewer PRIVATE "LINKER:--wrap=_glfwSelectPlatform,--wrap=glfwCreateWindow"
+                            "LINKER:--wrap=glfwMakeContextCurrent"
+                            "LINKER:--wrap=glfwGetProcAddress,--wrap=glfwSwapInterval,--wrap=glfwSwapBuffers")
+    else()
+        message(STATUS "Headless: off, libEGL not found")
+    endif()
+endif()
 
 # Camera link (camera_link.h): viewers open on one computer share their camera over ZeroMQ. It uses the
 # system's libzmq (Debian/Ubuntu: libzmq3-dev, macOS: brew install zeromq); without it the viewer is built

@@ -28,6 +28,9 @@
 //            renderer where it is available; G switches between the three.
 //    STEP 11 Meshes drawn with the splats: they fill the depth buffer first,
 //            and every splat is tested against it
+//    STEP 12 Stream to web browsers (--serve): frames go out as JPEGs, and the
+//            browsers' keys and mouse are replayed into raylib's input
+//    STEP 12b Headless: with no display (SSH, a server), the GPU through EGL
 //
 //  Usage:  ./splat_viewer              -> procedural demo scene
 //          ./splat_viewer scene.ply    -> standard 3DGS output .ply (read with happly)
@@ -35,6 +38,10 @@
 //          ./splat_viewer a.ply b.ply  -> one linked viewer per file
 //          ./splat_viewer scene.ply mesh.obj  -> the splats with a mesh (.obj, .gltf,
 //                                                .glb, or a .ply with faces)
+//          ./splat_viewer --serve[=PORT] scene.ply  -> also in web browsers, at
+//                                                http://<this computer>:8080/
+//          ./splat_viewer --serve --headless scene.ply  -> only there, no window; with
+//                                                no display, --serve alone does this
 //  Viewers open on one computer share their camera and view (camera_link.h); L
 //  unlinks one, M lets it pick views of its own.
 //  A .ply or .splat dropped on the window replaces the demo scene; on a linked
@@ -50,6 +57,8 @@
 #include "happly.h"
 
 #include "camera_link.h"
+#include "headless.h"
+#include "web_stream.h"
 
 #include <algorithm>
 #include <cmath>
@@ -2879,6 +2888,87 @@ static std::string CaptureAllViews(Scene &scene, const std::vector<SceneMesh> &m
 }
 
 // ----------------------------------------------------------------------------
+// STEP 12: Stream to web browsers (--serve, web_stream.h)
+//
+// Each frame renders into a texture the size of the browser's window, which is
+// read back and sent as a JPEG; the window shows the same texture. The browsers'
+// input is replayed into raylib's own input state with PlayAutomationEvent(),
+// the call behind raylib's recorded-input playback. IsKeyDown(), GetMouseDelta()
+// and the rest then see a browser's keys and mouse as if they were this window's,
+// so the input code of the main loop does not know a browser is there. Played
+// after EndDrawing() has polled the window's own events, a press lasts until its
+// release is played, as the window's own do.
+// ----------------------------------------------------------------------------
+// The event types of PlayAutomationEvent(). raylib keeps their enum (AutomationEventType)
+// inside rcore.c, so the values are repeated here, for the raylib version CMake fetches.
+static_assert(RAYLIB_VERSION_MAJOR == 5 && RAYLIB_VERSION_MINOR == 5,
+              "PLAY_* repeat AutomationEventType of raylib 5.5's rcore.c: check them against this raylib");
+enum PlayEvent {
+    PLAY_KEY_UP = 1, PLAY_KEY_DOWN = 2, PLAY_BUTTON_UP = 5, PLAY_BUTTON_DOWN = 6, PLAY_MOUSE_POSITION = 7,
+    PLAY_MOUSE_WHEEL = 8
+};
+
+static void Play(PlayEvent type, int param0, int param1 = 0)
+{
+    AutomationEvent event = {};
+    event.type = type;
+    event.params[0] = param0;
+    event.params[1] = param1;
+    PlayAutomationEvent(event);
+}
+
+static void PlayWebInput(const std::vector<WebInput> &events)
+{
+    // Motion moves the cursor from where it is: GetMouseDelta() is its distance from last frame's.
+    Vector2 cursor = GetMousePosition();
+    int x = (int)cursor.x, y = (int)cursor.y, wheel = 0;
+    bool moved = false;
+    for (const WebInput &e : events) {
+        switch (e.type) {
+        case WebInput::KEY:
+            if (e.a == KEY_ESCAPE || e.a == KEY_F12) break;  // quitting and screenshots stay with this computer
+            Play(e.b ? PLAY_KEY_DOWN : PLAY_KEY_UP, e.a);
+            break;
+        case WebInput::BUTTON:
+            Play(e.b ? PLAY_BUTTON_DOWN : PLAY_BUTTON_UP, e.a);
+            break;
+        case WebInput::MOVE:
+            x += e.a;
+            y += e.b;
+            moved = true;
+            break;
+        case WebInput::WHEEL:
+            wheel += e.a;
+            break;
+        }
+    }
+    if (moved) Play(PLAY_MOUSE_POSITION, x, y);
+    if (wheel) Play(PLAY_MOUSE_WHEEL, 0, wheel);  // replaces this frame's wheel, so summed above
+}
+
+// The window shows the frame the browsers get, fitted in, with the address to open.
+static void ShowWebFrame(Texture2D frame, const WebStream *web)
+{
+    float w = (float)GetScreenWidth(), h = (float)GetScreenHeight();
+    float s = fminf(w/frame.width, h/frame.height);
+    Rectangle source = { 0, 0, (float)frame.width, -(float)frame.height };  // render textures are bottom row first
+    Rectangle dest = { (w - frame.width*s)/2, (h - frame.height*s)/2, frame.width*s, frame.height*s };
+    BeginDrawing();
+    ClearBackground(BLACK);
+    rlSetBlendFactors(RL_ONE, RL_ZERO, RL_FUNC_ADD);  // copied, not blended: the splats left alpha below 1 in it
+    BeginBlendMode(BLEND_CUSTOM);
+    DrawTexturePro(frame, source, dest, Vector2{ 0, 0 }, 0.0f, WHITE);
+    EndBlendMode();
+    int viewers = WebViewerCount(web);
+    const char *line = TextFormat("Streaming at %s, %d %s", WebStreamUrl(web), viewers,
+                                  (viewers == 1) ? "browser" : "browsers");
+    int width = MeasureText(line, 16) + 16;
+    DrawRectangle((int)w - width - 8, 8, width, 26, Fade(BLACK, 0.7f));
+    DrawText(line, (int)w - width, 13, 16, viewers ? GREEN : RAYWHITE);
+    EndDrawing();
+}
+
+// ----------------------------------------------------------------------------
 // Main: load, then each frame  input -> project -> sort -> draw
 // ----------------------------------------------------------------------------
 int main(int argc, char **argv)
@@ -2888,18 +2978,61 @@ int main(int argc, char **argv)
     const char *path = NULL;  // the splat file; NULL: the demo scene, or meshes alone
     std::vector<const char *> otherSplatFiles;
     std::vector<std::string> meshFiles;
+    int servePort = 0;      // --serve[=PORT]: stream to web browsers too (STEP 12); 0 = not
+    bool headless = false;  // --headless: no window, even with a display (STEP 12b)
     for (int i = 1; i < argc; i++) {
-        if (IsMeshFile(argv[i])) meshFiles.push_back(argv[i]);
+        if (strcmp(argv[i], "--headless") == 0) {
+            headless = true;
+        } else if (strncmp(argv[i], "--serve", 7) == 0 && (argv[i][7] == '\0' || argv[i][7] == '=')) {
+            servePort = argv[i][7] ? atoi(argv[i] + 8) : WEB_DEFAULT_PORT;
+            if (servePort <= 0 || servePort > 65535) {
+                fprintf(stderr, "Not a port: %s\n", argv[i]);
+                return 1;
+            }
+        } else if (IsMeshFile(argv[i])) meshFiles.push_back(argv[i]);
         else if (!IsFileExtension(argv[i], ".ply;.splat")) TraceLog(LOG_WARNING, "Neither splats nor a mesh: %s", argv[i]);
         else if (!path) path = argv[i];
         else otherSplatFiles.push_back(argv[i]);
     }
 
-    SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
+    // Streaming, a timer paces the frames instead of vsync: a minimized window, or one on
+    // another workspace, may get no vsync from the compositor, and would stall the stream.
+    SetConfigFlags(FLAG_WINDOW_RESIZABLE | (servePort ? 0 : FLAG_VSYNC_HINT));
     // Created with the plain title, then renamed: on X11 the first title also becomes the
     // window's class, which the taskbar groups windows by, so every viewer keeps one class.
+    // STEP 12b: with no display (an SSH session, a server), the window cannot open; raylib 5.5
+    // would only warn, then crash at its first OpenGL call. Streaming, the viewer then renders
+    // headless, on the GPU all the same; without --serve, nobody would see a thing.
+    if (headless && !servePort) {
+        fprintf(stderr, "--headless shows nothing by itself: add --serve, to watch in a web browser\n");
+        return 1;
+    }
+    if (!headless && !HaveDisplay()) {
+        if (!servePort) {
+            fprintf(stderr, "No display to open the window on. Stream to a web browser instead, rendered here\n"
+                            "without a display: splat_viewer --serve scene.ply. Or, from an SSH session, use the\n"
+                            "desktop's display: DISPLAY=:1 splat_viewer scene.ply (echo $DISPLAY in a terminal on\n"
+                            "the desktop gives its number).\n");
+            return 1;
+        }
+        headless = true;
+    }
+    if (headless && !StartHeadless()) return 1;
     InitWindow(1280, 800, WindowTitle(NULL).c_str());
     SetWindowTitle(WindowTitle(path ? path : meshFiles.empty() ? NULL : meshFiles[0].c_str()).c_str());
+
+    // STEP 12: the stream starts before the scene loads, so a port in use fails at once,
+    // and a browser that opens the page meanwhile gets the first frame when it is ready.
+    WebStream *web = NULL;
+    if (servePort) {
+        web = OpenWebStream(servePort);
+        if (!web) { CloseWindow(); return 1; }
+        SetTargetFPS(60);
+    }
+    RenderTexture2D webTarget = {};          // this frame, for the browsers and the window
+    std::vector<unsigned char> webPixels;    // read back from webTarget
+    std::vector<WebInput> webInput;          // this frame's
+    int webViewers = 0;                      // browsers connected, as of last frame
 
     // Join the camera link first: a viewer that joins connects while its scene loads,
     // and so has the others' camera from its first frame.
@@ -2917,7 +3050,7 @@ int main(int argc, char **argv)
     Scene scene;
     if (path || meshFiles.empty()) {  // the splat file, or else the demo scene
         if (path) DrawLoadingScreen(path);
-        if (!LoadScene(path, &scene)) { CloseCameraLink(link); CloseWindow(); return 1; }
+        if (!LoadScene(path, &scene)) { CloseCameraLink(link); CloseWebStream(web); CloseWindow(); return 1; }
     }
     std::string dropFailed;  // name of the last dropped file, if it could not be loaded
     std::string notice;      // what C, a drop or a mesh that could not be loaded did, shown for a few seconds
@@ -2935,7 +3068,7 @@ int main(int argc, char **argv)
         else { notice = MeshLoadFailed(file.c_str(), problem); noticeTime = GetTime(); }
     }
     if (!path && !meshFiles.empty()) {  // meshes alone
-        if (meshes.empty()) { UnloadShader(meshShader); CloseCameraLink(link); CloseWindow(); return 1; }
+        if (meshes.empty()) { UnloadShader(meshShader); CloseCameraLink(link); CloseWebStream(web); CloseWindow(); return 1; }
         MeshOnlyScene(&scene, meshes);
         SetWindowTitle(WindowTitle(meshes[0].path.c_str()).c_str());
     }
@@ -2956,6 +3089,11 @@ int main(int argc, char **argv)
     bool shEnabled = (scene.sh.degree > 0);
     float scaleMod = 1.0f;
     float dotSize = DOT_SIZE;
+    // The HUD's frame rate and timings. Streaming, they change once a second, not every
+    // frame, so a camera that stands still renders the same picture, which is not sent again.
+    int hudFps = 0;
+    RenderStats hudStats = {};
+    double hudSortMs = 0.0, hudTime = -100.0;
 
     while (!WindowShouldClose()) {
         ReapNewViewers();
@@ -3038,6 +3176,23 @@ int main(int argc, char **argv)
         }
         int count = (int)scene.splats.size();
 
+        // ---- STEP 12: the browsers' keys and mouse, played into raylib's input, and the
+        // frame size: the window's, or streaming to browsers, the browser window's ----
+        int frameW = GetScreenWidth(), frameH = GetScreenHeight();
+        if (web) {
+            int w, h;
+            ReceiveWebInput(web, &webInput, &w, &h);
+            PlayWebInput(webInput);
+            if (w > 0) { frameW = w; frameH = h; }
+            if (WebViewerCount(web) != webViewers) {
+                webViewers = WebViewerCount(web);
+                notice = TextFormat("%d %s watching", webViewers, (webViewers == 1) ? "browser" : "browsers");
+                noticeTime = GetTime();
+            }
+        }
+        frameW = std::max(frameW, 16);  // a minimized window may report 0
+        frameH = std::max(frameH, 16);
+
         // ---- input: the camera flies like in a first-person game ----
         Vector2 md = GetMouseDelta();
         if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) || IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
@@ -3045,7 +3200,7 @@ int main(int argc, char **argv)
             cam.yaw -= md.x*LOOK_SPEED;
             cam.pitch = Clamp(cam.pitch - md.y*LOOK_SPEED, -MAX_PITCH, MAX_PITCH);
         }
-        ViewParams view = MakeView(&cam, GetScreenWidth(), GetScreenHeight());
+        ViewParams view = MakeView(&cam, frameW, frameH);
         if (IsMouseButtonDown(MOUSE_BUTTON_MIDDLE)) {
             // pan: what is 2 s of flying ahead follows the cursor
             float k = 2.0f*cam.speed/view.focal;
@@ -3113,27 +3268,43 @@ int main(int argc, char **argv)
         if (camBefore != camAfter) changedHere |= LINKED_CAMERA;
         if (picked >= 0 && syncView) changedHere |= LINKED_VIEW_MODE;
         SendLinked(link, LinkedState{ camAfter, mode }, changedHere);
-        view = MakeView(&cam, GetScreenWidth(), GetScreenHeight());
+        view = MakeView(&cam, frameW, frameH);
 
         RenderOptions options = { mode,     renderer, sortEnabled, shEnabled, flatQuads,
                                   scaleMod, dotSize,  drawSigma,   meshDraw };
-        Vector2 screen = { (float)GetScreenWidth(), (float)GetScreenHeight() };
+        Vector2 screen = { (float)frameW, (float)frameH };
         if (IsKeyPressed(KEY_C)) {  // every view from here, in one picture
             notice = CaptureAllViews(scene, meshes, meshShader, view, screen, options, buckets, shader, modeLoc);
             noticeTime = GetTime();
         }
 
-        BeginDrawing();
+        if (web) {  // STEP 12: into a texture of the browser's size
+            if (webTarget.texture.width != frameW || webTarget.texture.height != frameH) {
+                if (webTarget.id) UnloadRenderTexture(webTarget);
+                webTarget = LoadRenderTexture(frameW, frameH);
+                SetTextureFilter(webTarget.texture, TEXTURE_FILTER_BILINEAR);  // the window shrinks it to fit
+            }
+            BeginTextureMode(webTarget);
+        } else {
+            BeginDrawing();
+        }
         ClearBackground(Color{ 20, 20, 26, 255 });
         RenderStats stats = RenderView(scene, meshes, meshShader, view, screen, options, buckets, shader, modeLoc);
+        int fps = GetFPS();  // every frame: it averages the frame times it sees when called
+        if (!web || GetTime() - hudTime >= 1.0) {
+            hudFps = fps;
+            hudStats = stats;
+            hudSortMs = scene.gpuSort.lastMs;
+            hudTime = GetTime();
+        }
 
         // ---- HUD ----
         DrawRectangle(8, 8, 400, 402, Fade(BLACK, 0.6f));
-        DrawText(TextFormat("%d FPS   %d / %d %s visible", GetFPS(), stats.visible, count,
+        DrawText(TextFormat("%d FPS   %d / %d %s visible", hudFps, stats.visible, count,
                             scene.pointCloud ? "points" : "splats"), 16, 16, 18, RAYWHITE);
-        double cpuMs[3] = { stats.projectMs, stats.sortMs, stats.drawMs };
+        double cpuMs[3] = { hudStats.projectMs, hudStats.sortMs, hudStats.drawMs };
         DrawText((renderer == RENDERER_GPU_SORT)
-                     ? TextFormat("cull+sort on GPU %.1f ms  draw %.1f ms", scene.gpuSort.lastMs, cpuMs[2])
+                     ? TextFormat("cull+sort on GPU %.1f ms  draw %.1f ms", hudSortMs, cpuMs[2])
                  : (renderer == RENDERER_GPU)
                      ? TextFormat("cull %.1f ms  sort %.1f ms  upload+draw %.1f ms", cpuMs[0], cpuMs[1], cpuMs[2])
                      : TextFormat("project %.1f ms  sort %.1f ms  draw %.1f ms", cpuMs[0], cpuMs[1], cpuMs[2]),
@@ -3180,8 +3351,8 @@ int main(int argc, char **argv)
         DrawText("C all views  F12 screenshot  Esc quit", 16, 374, 16, LIGHTGRAY);
         if (GetTime() - noticeTime < 4.0) {
             int width = MeasureText(notice.c_str(), 18) + 16;
-            DrawRectangle(8, GetScreenHeight() - 40, width, 32, Fade(BLACK, 0.6f));
-            DrawText(notice.c_str(), 16, GetScreenHeight() - 33, 18, RAYWHITE);
+            DrawRectangle(8, frameH - 40, width, 32, Fade(BLACK, 0.6f));
+            DrawText(notice.c_str(), 16, frameH - 33, 18, RAYWHITE);
         }
         if (mode == VIEW_LINEARIZATION_ERROR) {
             // the color scale of view 5 (STEP 6d): Hellinger distance, linearized vs exact
@@ -3190,9 +3361,25 @@ int main(int argc, char **argv)
             for (int x = 0; x < 240; x++) DrawRectangle(70 + x, 422, 1, 14, RampColor(x/239.0f));
             DrawText(TextFormat(">= %.1f off", LINEARIZATION_RED), 318, 421, 16, RAYWHITE);
         }
-        EndDrawing();
+        if (web) {
+            // Read back only when a browser can take the frame: glReadPixels waits for the
+            // GPU to finish it, which costs this frame its overlap with the next.
+            if (WebWantsFrame(web)) {
+                rlDrawRenderBatchActive();  // the HUD is still in raylib's batch
+                webPixels.resize((size_t)frameW*frameH*4);
+                glReadPixels(0, 0, frameW, frameH, GL_RGBA, GL_UNSIGNED_BYTE, webPixels.data());
+                SendWebFrame(web, webPixels.data(), frameW, frameH);
+            }
+            EndTextureMode();
+            if (!headless) ShowWebFrame(webTarget.texture, web);
+            else { BeginDrawing(); EndDrawing(); }  // nothing to show: raylib's frame timing and input polling only
+        } else {
+            EndDrawing();
+        }
     }
 
+    CloseWebStream(web);
+    if (webTarget.id) UnloadRenderTexture(webTarget);
     CloseCameraLink(link);
     UnloadScene(&scene);
     for (SceneMesh &m : meshes) UnloadSceneMesh(&m);

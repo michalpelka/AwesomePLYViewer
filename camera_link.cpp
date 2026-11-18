@@ -52,7 +52,7 @@ struct Stamp {
 // What goes over the wire, as raw bytes: the viewers share one computer, so
 // they agree on byte order and layout. MAGIC changes whenever Message does, so
 // messages from other versions of the viewer, or from other programs, are dropped.
-static const uint32_t MAGIC = 0x324b4c53;  // "SLK2"
+static const uint32_t MAGIC = 0x334b4c53;  // "SLK3"
 struct Message {
     uint32_t magic;
     uint32_t unused;
@@ -96,12 +96,14 @@ static void Change(const CameraLink *link, Stamp *stamp, T *value, const T &newV
     *value = newValue;
 }
 
+// Every member of LinkedCamera: a received camera must not put NaN or infinity in the viewer's.
 static bool Finite(const LinkedCamera &camera)
 {
-    const float *f = reinterpret_cast<const float *>(&camera);  // LinkedCamera holds only floats
-    for (size_t i = 0; i < sizeof camera/sizeof(float); i++)
-        if (!std::isfinite(f[i])) return false;
-    return true;
+    for (double p : camera.position)
+        if (!std::isfinite(p)) return false;
+    for (float f : camera.forward)
+        if (!std::isfinite(f)) return false;
+    return std::isfinite(camera.fovy) && std::isfinite(camera.speed);
 }
 
 static void *Socket(CameraLink *link, int type)

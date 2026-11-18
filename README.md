@@ -1,7 +1,7 @@
 # Gaussian splat viewer (raylib), GPU version
 
-A minimal 3D Gaussian Splatting viewer: one C++ file, commented step by step (STEP 1–10 in `splat_viewer.cpp`), and
-`camera_link.cpp` that lets several viewers share their camera.
+A minimal 3D Gaussian Splatting viewer: one C++ file, commented step by step (STEP 1–11 in `splat_viewer.cpp`), and
+`camera_link.cpp` that lets several viewers share their camera. It draws meshes with the splats too (STEP 11).
 STEPs 1–8 run the whole render pipeline on the CPU, so it can be read and stepped through in a debugger. STEP 9
 moves the per-splat projection into a vertex shader, and STEP 10 moves culling and sorting into compute shaders, so
 the CPU does no per-splat work at all. STEP 10 is the default renderer; `G` switches to the other two.
@@ -49,8 +49,25 @@ the CPU. macOS gets this automatically, since its OpenGL stops at 4.1.
     ./build/splat_viewer scene.ply     # standard 3DGS point_cloud.ply (with spherical harmonics)
     ./build/splat_viewer scene.splat   # compact .splat (antimatter15 web viewer format)
     ./build/splat_viewer a.ply b.ply   # one viewer per file, flying together (below)
+    ./build/splat_viewer scene.ply mesh.obj   # the splats with a mesh (below)
 
 To open a scene without restarting, drop a `.ply` or `.splat` file on the window.
+
+### Meshes
+
+A mesh, `.obj` (with its `.mtl`), `.gltf`, `.glb`, or a `.ply` with faces (as MeshLab, CloudCompare or
+`splat_to_ellipsoids.py` write them), is drawn with the splats as an opaque surface: it hides the splats behind it, and
+the splats in front of it blend over it. Give it on the command line after the splats, or drop it on the window: it
+joins the splats already there, and replaces the demo scene. `T` switches between shaded, wireframe (drawn over the
+splats) and hidden. A mesh is in the same coordinates as the splats and turns with them (`Z`, `F`); a `.ply` mesh in
+map coordinates (UTM) lines up with a point cloud of the same place. A mesh given alone opens with no splats, framed
+on the mesh, +Y up for `.obj` and glTF and Z up for `.ply`; splats dropped on it then join it. A viewer started for
+another splat file (several on the command line, or a drop) gets the meshes too.
+
+The meshes are shaded flat, lit like the ellipsoids of view 4, with vertex colors, material colors and textures; the
+normals of the file are not used. View 4 meets a mesh where the surfaces cross, so a mesh of the same ellipsoids, from
+`splat_to_ellipsoids.py`, checks view 4: the two agree where the ray-cast ellipsoids cover the mesh, but for a speckle
+at its corners.
 
 Several viewers open at once share one camera and view: fly in any of them, or pick a view with `1` … `7`, and the
 others follow. This lets you compare two scenes, say two training iterations of one capture, or one scene in two
@@ -66,14 +83,14 @@ and the folder it is in, as in `iteration_7000/point_cloud.ply`.
 The first viewer becomes the server, on TCP ports 25150 and 25151 of 127.0.0.1, and the ones after it connect to it
 as clients. When the server quits, a client takes its place within 2 s. The camera is shared in the file's own
 coordinates, so viewers whose scenes were turned to different up axes (`Z`, `F`) still look at the same part of
-it. `L` unlinks a viewer, and links it again; a viewer that joins takes the camera and view the others have. An
+it, and point clouds and meshes of one place line up, though each viewer moves its own to the origin. `L` unlinks a viewer, and links it again; a viewer that joins takes the camera and view the others have. An
 unlinked viewer loads a dropped file in place of its scene, as the demo scene does. `M` keeps the camera linked but
 lets a viewer pick views of its own: its picks no longer switch the others, nor theirs it; `M` again takes the view
 picked last.
 
 | Input | Action |
 |---|---|
-| Drop a file on the window | open it: in place of the demo scene, or else in a new viewer that flies with this one |
+| Drop a file on the window | open it: in place of the demo scene, or else in a new viewer that flies with this one; a mesh joins the splats |
 | `W` `A` `S` `D` | fly forward / left / back / right (forward is where the camera looks) |
 | `Q` `E` | fly straight down / up |
 | Left or right drag | look around |
@@ -91,6 +108,7 @@ picked last.
 | `B` | flat quads: the fragment shader only fills each splat's quad with its color, to show what the vertex shader drew |
 | `C` | save all views from this camera as one picture, `views_<date>_<time>.png` in the folder the viewer was started from |
 | `R` | reset camera |
+| `T` | meshes: shaded / wireframe / hidden |
 | `L` | link the camera and view with the other viewers on this computer on/off (on by default) |
 | `M` | share the view (`1` … `7`) with the linked viewers on/off (on by default); the camera stays linked |
 
@@ -117,6 +135,10 @@ picked last.
    using a radix sort (two passes of 8 bits). The sort is stable like the CPU one, so splats at equal depth do not
    swap places from frame to frame. It writes the order straight into the buffer step 9 draws from; only the
    visible count comes back to the CPU. Needs OpenGL 4.3.
+11. **Meshes**: raylib draws them first, through the same pinhole, and they fill the depth buffer. Each splat is then
+   tested against it at the depth of its center (view 4: where the pixel's ray hits the ellipsoid), and writes no
+   depth itself, as the sort orders the splats among themselves. **11a**: `.ply` meshes, cut into chunks of 65536
+   vertices for raylib's 16-bit indices.
 
 ## Example scenes (not included, CMake can download them)
 
@@ -147,3 +169,6 @@ The train scene tiled 25 times (18.5M splats, a 4.6 GB `.ply`) loads in 14 s and
 and 2.8 GB of GPU memory. With the GPU sort it runs at about 12 FPS: 10–12 ms to cull and sort, and about 75 ms to
 draw 18.4M overlapping splats, so the draw itself is now the limit. With the CPU sort it runs at about 4 FPS, as
 culling and sorting take about 100 ms each. Compressed formats (`.spz`, compressed `.ply`) are not supported.
+
+raylib 5.5 reads the 32-bit indices of a glTF mesh as 16-bit ones, so a glTF mesh with more than 65536 vertices would
+come out wrong; the viewer refuses it. `.ply` meshes of any size work.

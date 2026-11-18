@@ -12,12 +12,16 @@
 // The camera that linked viewers share. It is in the coordinates of the scene
 // file, before the turn that brings the file's up axis to +Y (Z and F in the
 // viewer), so two viewers that turned the same file differently still look at
-// the same part of it.
+// the same part of it. They are the file's own coordinates, before a viewer
+// moves a point cloud or mesh to the origin, so two files of one place line up
+// too; the position is in doubles, as those can be map coordinates (UTM).
 struct LinkedCamera {
-    float position[3];
+    double position[3];
     float forward[3];  // unit vector, where the camera looks
     float fovy;        // vertical field of view in radians
     float speed;       // how fast WASD moves, in world units per second
+    // A new member also goes in Finite() in camera_link.cpp, which checks every received one.
+    bool operator==(const LinkedCamera &) const = default;  // member by member, never the padding
 };
 
 // Everything linked viewers share. Each part changes on its own: moving the

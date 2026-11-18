@@ -26,15 +26,20 @@
 //    STEP 10 Cull and sort on the GPU too, with compute shaders (OpenGL 4.3):
 //            the CPU does no per-splat work at all. This is the default
 //            renderer where it is available; G switches between the three.
+//    STEP 11 Meshes drawn with the splats: they fill the depth buffer first,
+//            and every splat is tested against it
 //
 //  Usage:  ./splat_viewer              -> procedural demo scene
 //          ./splat_viewer scene.ply    -> standard 3DGS output .ply (read with happly)
 //          ./splat_viewer scene.splat  -> compact .splat (web viewer format)
 //          ./splat_viewer a.ply b.ply  -> one linked viewer per file
+//          ./splat_viewer scene.ply mesh.obj  -> the splats with a mesh (.obj, .gltf,
+//                                                .glb, or a .ply with faces)
 //  Viewers open on one computer share their camera and view (camera_link.h); L
 //  unlinks one, M lets it pick views of its own.
 //  A .ply or .splat dropped on the window replaces the demo scene; on a linked
 //  viewer that already shows a file, it opens in a new viewer flying with it.
+//  A dropped mesh joins the splats of the viewer it is dropped on.
 // ============================================================================
 
 #include "raylib.h"
@@ -130,9 +135,12 @@ static_assert(sizeof(viewNames)/sizeof(viewNames[0]) == VIEW_MODE_COUNT, "one na
 // ----------------------------------------------------------------------------
 static float Sigmoid(float x) { return 1.0f/(1.0f + expf(-x)); }
 
-static std::vector<Splat> SplatsFromPointCloud(happly::Element &vertex);  // STEP 2d, below
+static std::vector<Splat> SplatsFromPointCloud(happly::Element &vertex, double origin[3]);  // STEP 2d, below
 
-static std::vector<Splat> LoadSplatsFromPly(const char *path, SphericalHarmonics *sh, bool *pointCloud)
+// origin: set to where in the file the splats' (0, 0, 0) is. A point cloud is moved to the origin
+// (STEP 2d); a 3DGS file stays where it is, so it is (0, 0, 0).
+static std::vector<Splat> LoadSplatsFromPly(const char *path, SphericalHarmonics *sh, bool *pointCloud,
+                                            double origin[3])
 {
     std::vector<Splat> splats;
     try {
@@ -143,7 +151,7 @@ static std::vector<Splat> LoadSplatsFromPly(const char *path, SphericalHarmonics
         *pointCloud = !(vertex.hasProperty("f_dc_0") && vertex.hasProperty("opacity") &&
                         vertex.hasProperty("scale_0") && vertex.hasProperty("rot_0"));
         if (*pointCloud) {
-            splats = SplatsFromPointCloud(vertex);
+            splats = SplatsFromPointCloud(vertex, origin);
             TraceLog(LOG_INFO, "Loaded %d points from %s (a point cloud: no Gaussian properties)", (int)splats.size(),
                      path);
             return splats;
@@ -363,6 +371,26 @@ static float ColorScale(happly::Element &vertex, const std::string &name)
     return 1.0f;
 }
 
+// The red, green and blue of every vertex, opaque; none if the file lacks one
+// of them. Also read for .ply meshes (STEP 11a).
+static std::vector<Color> RgbColumns(happly::Element &vertex)
+{
+    std::vector<Color> colors;
+    if (!vertex.hasProperty("red") || !vertex.hasProperty("green") || !vertex.hasProperty("blue")) return colors;
+    colors.assign(vertex.count, Color{ 0, 0, 0, 255 });
+    const char *channels[3] = { "red", "green", "blue" };
+    for (int c = 0; c < 3; c++) {
+        std::vector<double> v = NumericColumn(vertex, channels[c]);
+        float scale = ColorScale(vertex, channels[c]);
+        for (size_t i = 0; i < colors.size(); i++) {
+            unsigned char value = (unsigned char)Clamp((float)v[i]*scale + 0.5f, 0.0f, 255.0f);
+            Color &col = colors[i];
+            if (c == 0) col.r = value; else if (c == 1) col.g = value; else col.b = value;
+        }
+    }
+    return colors;
+}
+
 // The value a fraction p of the values lie below, from up to 100k evenly
 // spread samples (exact enough for a color range, and fast).
 static double Percentile(const std::vector<double> &values, double p)
@@ -409,7 +437,8 @@ static float EstimatePointSpacing(const std::vector<Splat> &points)
     return gaps[gaps.size()/2]*sqrtf((float)m/n);
 }
 
-static std::vector<Splat> SplatsFromPointCloud(happly::Element &vertex)
+// center: set to the center of the bounding box, in the file, which the points are moved by.
+static std::vector<Splat> SplatsFromPointCloud(happly::Element &vertex, double center[3])
 {
     size_t count = vertex.count;
     std::vector<Splat> points(count);
@@ -417,7 +446,6 @@ static std::vector<Splat> SplatsFromPointCloud(happly::Element &vertex)
 
     // Positions, one axis at a time, moved by the center of their bounding box
     const char *axes[3] = { "x", "y", "z" };
-    double center[3];
     std::vector<double> height;  // Z as stored, for the color ramp
     for (int a = 0; a < 3; a++) {
         std::vector<double> v = NumericColumn(vertex, axes[a]);
@@ -440,18 +468,10 @@ static std::vector<Splat> SplatsFromPointCloud(happly::Element &vertex)
         for (char &c : lower) c = (char)tolower(c);
         if (lower == "intensity" || lower == "scalar_intensity") intensity = name;
     }
-    bool rgb = vertex.hasProperty("red") && vertex.hasProperty("green") && vertex.hasProperty("blue");
+    std::vector<Color> colors = RgbColumns(vertex);
+    bool rgb = !colors.empty();
     if (rgb) {
-        const char *channels[3] = { "red", "green", "blue" };
-        for (int c = 0; c < 3; c++) {
-            std::vector<double> v = NumericColumn(vertex, channels[c]);
-            float scale = ColorScale(vertex, channels[c]);
-            for (size_t i = 0; i < count; i++) {
-                unsigned char value = (unsigned char)Clamp((float)v[i]*scale + 0.5f, 0.0f, 255.0f);
-                Color &col = points[i].color;
-                if (c == 0) col.r = value; else if (c == 1) col.g = value; else col.b = value;
-            }
-        }
+        for (size_t i = 0; i < count; i++) points[i].color = colors[i];
     } else if (!intensity.empty()) {
         std::vector<double> v = NumericColumn(vertex, intensity);
         double lo = Percentile(v, 0.01), hi = Percentile(v, 0.99);  // ignore the brightest and darkest 1%
@@ -580,7 +600,25 @@ struct ViewParams {
     float focal;      // focal length in pixels
     float cx, cy;     // principal point = screen center
     float tanHalfFovX, tanHalfFovY;
+    float zNear, zFar;  // the depth range of the depth buffer (STEP 11)
 };
+
+// STEP 11: where a point `depth` in front of the camera lands in the depth
+// buffer, as OpenGL's perspective projection puts it (normalized device
+// coordinates, -1 at zNear to 1 at zFar): a + b/depth. Splats get their depth
+// this way, so that they compare right with the meshes'. Clamped, so that no
+// splat is clipped away: one beyond zFar is behind every mesh.
+static Vector2 DepthMapping(const ViewParams *v)
+{
+    float n = v->zNear, f = v->zFar;
+    return Vector2{ (f + n)/(f - n), -2.0f*f*n/(f - n) };
+}
+
+static float NdcDepth(const ViewParams *v, float depth)
+{
+    Vector2 m = DepthMapping(v);
+    return Clamp(m.x + m.y/depth, -1.0f, 1.0f);
+}
 
 static ViewParams MakeView(const FlyCamera *cam, int width, int height)
 {
@@ -599,6 +637,12 @@ static ViewParams MakeView(const FlyCamera *cam, int width, int height)
     v.cy = 0.5f*height;
     v.tanHalfFovY = tanf(0.5f*cam->fovy);
     v.tanHalfFovX = v.tanHalfFovY*width/height;
+
+    // The depth buffer resolves depth finest near zNear, so zNear follows the
+    // scale the camera works at: as far as it flies in 1/100 s. A 24-bit depth
+    // buffer then tells surfaces apart to about depth²/(zNear·2²⁴).
+    v.zNear = fmaxf(0.01f*cam->speed, 1e-6f);
+    v.zFar = 1e5f*v.zNear;
     return v;
 }
 
@@ -1066,8 +1110,12 @@ static const char *SPLAT_FS =
     "                        // 6 gaussian per ray\n"
     "uniform int flatQuads;  // B: fill each quad with its color, to see what the vertex shader drew\n"
     "uniform float drawSigma;  // k: view 2 draws its ring at k sigma ([ and ])\n"
+    "uniform vec2 depthMap;  // STEP 11: depth -> normalized device depth, a + b/depth (DepthMapping())\n"
     "out vec4 finalColor;\n"
     "void main() {\n"
+    "    // STEP 11: a splat is tested against the meshes at its center's depth, which the vertex\n"
+    "    // shader set; view 4 below puts in the depth of the ray's hit instead.\n"
+    "    gl_FragDepth = gl_FragCoord.z;\n"
     "    if (flatQuads == 1) { finalColor = vec4(fragColor.rgb, 1.0); return; }  // no work done here\n"
     "    if (mode == 5) { finalColor = fragColor; return; }  // view 6's arrows: flat\n"
     "    if (mode == 6) {\n"
@@ -1094,6 +1142,8 @@ static const char *SPLAT_FS =
     "        if (disc < 0.0) discard;                           // the ray misses the ellipsoid\n"
     "        float light = 0.2 + 0.8*max(dot(n, normalize(vec3(-0.35, 0.45, -1.0))), 0.0);  // from up left\n"
     "        finalColor = vec4(fragColor.rgb*light, 1.0);\n"
+    "        // the hit's own depth, so the ellipsoids meet the meshes where their surfaces cross (STEP 11)\n"
+    "        gl_FragDepth = 0.5 + 0.5*clamp(depthMap.x + depthMap.y/t, -1.0, 1.0);\n"
     "        return;\n"
     "    }\n"
     "    float r2 = dot(fragTexCoord, fragTexCoord);\n"
@@ -1114,8 +1164,9 @@ static const char *SPLAT_FS =
 
 // The vertex shader of the CPU path: the corners come in pixels, it only
 // passes their values on. For view 4 they carry the ray (STEP 6c): x, y in the
-// texcoord, z in the vertex z, and L as the normal's direction (1, L, 0),
-// because raylib normalizes normals.
+// texcoord, z in the vertex z, and L in the normal. raylib normalizes normals,
+// so the normal carries numbers as its direction: (1, L, depth), depth being
+// the splat's normalized device depth (STEP 11).
 static const char *QUAD_VS =
     "#version 330\n"
     "in vec3 vertexPosition;\n"
@@ -1136,6 +1187,7 @@ static const char *QUAD_VS =
     "    fragEyeDist = (vertexNormal.x > 0.0) ? vertexNormal.y/vertexNormal.x : 0.0;\n"
     "    fragViewXY = vec2(vertexPosition.x - pinhole.y, pinhole.z - vertexPosition.y)/pinhole.x;\n"
     "    gl_Position = mvp*vec4(vertexPosition.xy, 0.0, 1.0);\n"
+    "    gl_Position.z = (vertexNormal.x > 0.0) ? vertexNormal.z/vertexNormal.x : 0.0;\n"
     "}\n";
 
 // dotSize: diameter in pixels of the dots of the centers view.
@@ -1159,6 +1211,7 @@ static void DrawSplats(const ProjectedSplat *proj, const int *order, int count, 
             Color c;
             if (!NormalArrow(&splats[order[i]], v, scaleMod, drawSigma, corners, &c)) continue;
             rlColor4ub(c.r, c.g, c.b, c.a);
+            rlNormal3f(1.0f, 0.0f, NdcDepth(v, proj[order[i]].depth));  // STEP 11: at the splat's depth
             for (Vector2 corner : corners) rlVertex2f(corner.x, corner.y);
         }
         rlEnd();
@@ -1176,6 +1229,8 @@ static void DrawSplats(const ProjectedSplat *proj, const int *order, int count, 
                   : (mode == VIEW_PER_RAY) ? PER_RAY_SIGMA + 1.0f : 3.0f;
     Vector3 pinhole = { v->focal, v->cx, v->cy };
     SetShaderValue(shader, GetShaderLocation(shader, "pinhole"), &pinhole, SHADER_UNIFORM_VEC3);
+    Vector2 depthMap = DepthMapping(v);
+    SetShaderValue(shader, GetShaderLocation(shader, "depthMap"), &depthMap, SHADER_UNIFORM_VEC2);
 
     BeginShaderMode(shader);
     rlBegin(RL_QUADS);
@@ -1199,13 +1254,14 @@ static void DrawSplats(const ProjectedSplat *proj, const int *order, int count, 
         // works for every splat.
         const float corners[4][2] = { { -1, -1 }, { -1, 1 }, { 1, 1 }, { 1, -1 } };
         rlColor4ub(c.r, c.g, c.b, c.a);
+        float depth = NdcDepth(v, p->depth);  // STEP 11: the meshes hide the splat behind them
         if (mode == VIEW_ELLIPSOIDS || mode == VIEW_PER_RAY) {
             // STEP 6c: each corner's ray in the ellipsoid's whitened frame (view 7: 3 sigma, blurred, STEP 6f)
             float M[3][3];
             bool perRay = (mode == VIEW_PER_RAY);
             float L = EllipsoidRayFrame(&splats[idx], v, scaleMod, perRay ? PER_RAY_SIGMA : drawSigma, M,
                                         perRay ? LowPass3D(p->depth, v->focal) : 0.0f);
-            rlNormal3f(1.0f, L, 0.0f);
+            rlNormal3f(1.0f, L, depth);
             for (const auto &k : corners) {
                 Vector2 px = { p->center.x + k[0]*a1.x + k[1]*a2.x, p->center.y + k[0]*a1.y + k[1]*a2.y };
                 float x = (px.x - v->cx)/v->focal, y = (v->cy - px.y)/v->focal;  // the ray (x, y, 1), camera axes
@@ -1213,6 +1269,7 @@ static void DrawSplats(const ProjectedSplat *proj, const int *order, int count, 
                 rlVertex3f(px.x, px.y, M[2][0]*x + M[2][1]*y + M[2][2]);
             }
         } else {
+            rlNormal3f(1.0f, 0.0f, depth);
             for (const auto &k : corners) {
                 rlTexCoord2f(reach*k[0], reach*k[1]);
                 rlVertex2f(p->center.x + k[0]*a1.x + k[1]*a2.x, p->center.y + k[0]*a1.y + k[1]*a2.y);
@@ -1266,6 +1323,7 @@ uniform int mode;                          // ViewMode: 0 gaussian, 1 ellipse ou
                                            // 6 gaussian per ray
 uniform float dotSize;                     // dot diameter in pixels (mode 2)
 uniform float drawSigma;                   // k: views 2, 4 and 5 use the k-sigma ellipse/ellipsoid ([ and ])
+uniform vec2 depthMap;                     // STEP 11: depth -> normalized device depth, a + b/depth
 
 out vec2 fragTexCoord;                     // the same outputs as QUAD_VS, the vertex shader of the
 out vec4 fragColor;                        // CPU path, so the fragment shader is shared with it
@@ -1396,6 +1454,7 @@ void main()
     float b = dot(T0, Sigma*T1);
     float e = dot(T1, Sigma*T1) + 0.3;
     vec2 center = vec2(0.5*screenSize.x + focal*tx/tz, 0.5*screenSize.y - focal*ty/tz);
+    float depth = clamp(depthMap.x + depthMap.y/tz, -1.0, 1.0);  // STEP 11: the meshes hide the splat behind them
 
     // STEP 6e (view 6, its second draw): the normal arrow, as in NormalArrow(). The 6 vertices
     // of the instance make 2 triangles, shaft and head, picked by gl_VertexID.
@@ -1419,7 +1478,7 @@ void main()
         fragEyeDist = 0.0;
         fragViewXY = vec2(0.0);
         fragColor = vec4(0.5*n + 0.5, nf.w);
-        gl_Position = vec4(2.0*pixel.x/screenSize.x - 1.0, 1.0 - 2.0*pixel.y/screenSize.y, 0.0, 1.0);
+        gl_Position = vec4(2.0*pixel.x/screenSize.x - 1.0, 1.0 - 2.0*pixel.y/screenSize.y, depth, 1.0);
         return;
     }
 
@@ -1498,7 +1557,7 @@ void main()
         fragRay = vec3(dot(e1, w), dot(e2, w), dot(e3, w));
     }
     // pixels -> clip space; y flips because pixel rows go down and clip y goes up
-    gl_Position = vec4(2.0*pixel.x/screenSize.x - 1.0, 1.0 - 2.0*pixel.y/screenSize.y, 0.0, 1.0);
+    gl_Position = vec4(2.0*pixel.x/screenSize.x - 1.0, 1.0 - 2.0*pixel.y/screenSize.y, depth, 1.0);
 }
 )";
 
@@ -1679,6 +1738,8 @@ static void DrawSplatsGpu(GpuRenderer *g, const int *order, int count, const Vie
     int flat = flatQuads;
     SetShaderValue(g->shader, GetShaderLocation(g->shader, "flatQuads"), &flat, SHADER_UNIFORM_INT);
     SetShaderValue(g->shader, GetShaderLocation(g->shader, "drawSigma"), &drawSigma, SHADER_UNIFORM_FLOAT);
+    Vector2 depthMap = DepthMapping(v);
+    SetShaderValue(g->shader, GetShaderLocation(g->shader, "depthMap"), &depthMap, SHADER_UNIFORM_VEC2);
     SetShaderValueMatrix(g->shader, g->locToFile, QuaternionToMatrix(toFileFrame));
 
     rlDrawRenderBatchActive();  // draw anything raylib queued before us first
@@ -2054,6 +2115,319 @@ static int CullAndSortGpu(GpuSort *s, const GpuRenderer *g, const ViewParams *v,
 }
 
 // ----------------------------------------------------------------------------
+// STEP 11: Meshes drawn with the splats
+//
+// A mesh (.obj, .gltf, .glb, or a .ply with faces) is an opaque surface. raylib
+// loads it and draws it through a camera with the pinhole of STEP 4, and the
+// two kinds of things meet in the depth buffer:
+//   1. the meshes are drawn first, and write their depth
+//   2. every splat is drawn at its center's depth, tested against what the
+//      meshes wrote, and writes none itself
+// So a mesh hides the splats behind it, and a splat in front of a mesh blends
+// over it as over anything else. Among themselves the splats still need STEP
+// 7's sort: a depth buffer keeps only the nearest surface, and blending needs
+// them all, in order.
+// Before this step the splats had no depth, only pixels. Their depth now comes
+// from the projection OpenGL uses for the meshes (DepthMapping()). View 4 uses
+// the depth where each pixel's ray hits the ellipsoid (STEP 6c), so its
+// ellipsoids cut into a mesh where the two surfaces cross. A mesh of the same
+// ellipsoids (from splat_to_ellipsoids.py) has its corners on the true surface
+// and its flat triangles just inside, so where the two agree view 4 covers it,
+// but for a speckle at the corners. The mesh's depth also settles, pixel by
+// pixel, which of two ellipsoids that cross is in front, which drawing them in
+// the order of their centers (STEP 7) alone cannot.
+// The meshes are shaded flat, lit as view 4 lights its ellipsoids. Each
+// triangle's normal comes from how its position changes from pixel to pixel,
+// so a file needs no normals, and both sides of a triangle are lit.
+// The meshes are in the file's coordinates, as the splats are, and turn with
+// them (Z, F). T switches between shaded, wireframe (drawn over the splats,
+// without the depth test against them) and hidden.
+// ----------------------------------------------------------------------------
+static const char *MESH_VS = R"(#version 330
+in vec3 vertexPosition;
+in vec2 vertexTexCoord;
+in vec4 vertexColor;
+uniform mat4 mvp;
+uniform mat4 matView;
+uniform mat4 matModel;
+out vec2 fragTexCoord;
+out vec4 fragColor;
+out vec3 fragViewPos;  // in OpenGL's camera axes: x right, y up, z back toward the eye
+void main()
+{
+    fragTexCoord = vertexTexCoord;
+    fragColor = vertexColor;
+    fragViewPos = (matView*matModel*vec4(vertexPosition, 1.0)).xyz;
+    gl_Position = mvp*vec4(vertexPosition, 1.0);
+}
+)";
+
+static const char *MESH_FS = R"(#version 330
+in vec2 fragTexCoord;
+in vec4 fragColor;
+in vec3 fragViewPos;
+uniform sampler2D texture0;  // the material's color texture (raylib binds a white one if it has none)
+uniform vec4 colDiffuse;     // the material's color
+uniform int wire;            // 1: wireframe, in one color that stands out on the splats
+out vec4 finalColor;
+void main()
+{
+    if (wire == 1) { finalColor = vec4(0.35, 0.85, 1.0, 0.8); return; }
+    vec4 color = texture(texture0, fragTexCoord)*colDiffuse*fragColor;
+    if (color.a < 0.5) discard;  // cut-outs in a texture (leaves, fences)
+    vec3 n = normalize(cross(dFdx(fragViewPos), dFdy(fragViewPos)));  // the triangle's normal
+    if (dot(n, fragViewPos) > 0.0) n = -n;                              // the side facing the camera
+    float light = 0.2 + 0.8*max(dot(n, normalize(vec3(-0.35, 0.45, 1.0))), 0.0);  // view 4's light (z flips here)
+    finalColor = vec4(color.rgb*light, 1.0);
+}
+)";
+
+enum MeshDraw { MESH_SHADED = 0, MESH_WIRE, MESH_HIDDEN, MESH_DRAW_COUNT };  // T cycles through them
+static const char *meshDrawNames[] = { "shaded", "wireframe", "HIDDEN" };
+static_assert(sizeof(meshDrawNames)/sizeof(meshDrawNames[0]) == MESH_DRAW_COUNT, "one name per mesh draw");
+
+struct SceneMesh {
+    std::string path;   // as given: a viewer started from this one opens it too
+    Model model;        // the file's meshes and materials, on the GPU
+    double origin[3];   // where in the file the model's (0, 0, 0) is (a .ply mesh is moved, see STEP 11a)
+    BoundingBox box;    // in the model's coordinates
+    long triangles;
+};
+
+// A .ply with faces is a mesh; without, it holds splats or a point cloud. Only the header is read.
+static bool PlyHasFaces(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    char line[1024];
+    long faces = 0;
+    if (fgets(line, sizeof line, f) && strncmp(line, "ply", 3) == 0) {
+        while (fgets(line, sizeof line, f) && strncmp(line, "end_header", 10) != 0) {
+            if (sscanf(line, "element face %ld", &faces) == 1 && faces > 0) break;
+        }
+    }
+    fclose(f);
+    return faces > 0;
+}
+
+static bool IsMeshFile(const char *path)
+{
+    return IsFileExtension(path, ".obj;.gltf;.glb") || (IsFileExtension(path, ".ply") && PlyHasFaces(path));
+}
+
+// ----------------------------------------------------------------------------
+// STEP 11a: A .ply mesh, as MeshLab, CloudCompare or splat_to_ellipsoids.py
+// write them (raylib does not read .ply)
+//
+// The vertices are read as a point cloud's are (STEP 2d): positions as doubles,
+// moved to put the center of their bounding box at the origin, and colors from
+// red/green/blue if the file has them. A face with more than 3 corners is cut
+// into triangles, fanning out from its first corner.
+// raylib draws a mesh with 16-bit indices, so at most 65536 vertices each. The
+// triangles go to the GPU in chunks, each a raylib mesh of the vertices its
+// triangles use; a vertex that triangles in two chunks share is copied.
+// ----------------------------------------------------------------------------
+#define MAX_CHUNK_VERTICES 65536
+
+// The faces as happly holds them: all the vertex indices one after the other, and where
+// each face starts. happly's getFaceIndices() would copy them into one std::vector per
+// face, which for millions of faces takes seconds and gigabytes.
+template <typename T>
+static bool FlatFaces(happly::Property *property, std::vector<uint32_t> *indices, std::vector<size_t> *starts)
+{
+    auto *list = dynamic_cast<happly::TypedListProperty<T> *>(property);
+    if (!list) return false;
+    indices->assign(list->flattenedData.begin(), list->flattenedData.end());  // negative ones get too large: refused
+    *starts = list->flattenedIndexStart;  // face f has the indices from starts[f] to starts[f + 1]
+    return true;
+}
+
+// origin: set to where in the file the model's (0, 0, 0) is. problem: why it failed.
+static bool LoadPlyMesh(const char *path, Model *model, double origin[3], std::string *problem)
+{
+    std::vector<double> xyz[3];
+    std::vector<Color> rgb;  // empty if the file has no colors
+    std::vector<uint32_t> indices;
+    std::vector<size_t> starts;
+    try {
+        happly::PLYData ply(path);
+        happly::Element &vertex = ply.getElement("vertex");
+        const char *axes[3] = { "x", "y", "z" };
+        for (int a = 0; a < 3; a++) xyz[a] = NumericColumn(vertex, axes[a]);
+        rgb = RgbColumns(vertex);
+        happly::Element &face = ply.getElement("face");
+        bool found = false;
+        for (const char *name : { "vertex_indices", "vertex_index" }) {
+            if (found || !face.hasProperty(name)) continue;
+            happly::Property *p = face.getPropertyPtr(name).get();
+            found = FlatFaces<int32_t>(p, &indices, &starts) || FlatFaces<uint32_t>(p, &indices, &starts) ||
+                    FlatFaces<int16_t>(p, &indices, &starts) || FlatFaces<uint16_t>(p, &indices, &starts) ||
+                    FlatFaces<int8_t>(p, &indices, &starts) || FlatFaces<uint8_t>(p, &indices, &starts);
+        }
+        if (!found) { *problem = "its faces have no list of vertex_indices"; return false; }
+    } catch (const std::exception &e) {
+        *problem = e.what();
+        return false;
+    }
+
+    size_t n = xyz[0].size();
+    for (int a = 0; a < 3; a++) {
+        auto [lo, hi] = std::minmax_element(xyz[a].begin(), xyz[a].end());
+        origin[a] = (n > 0) ? 0.5*(*lo + *hi) : 0.0;
+    }
+
+    std::vector<Mesh> chunks;
+    std::vector<int> local(n, -1);              // a vertex's index in the chunk being filled; -1: not in it
+    std::vector<uint32_t> used;                 // the file's vertices in that chunk, in the chunk's order
+    std::vector<unsigned short> chunkIndices;   // its triangles
+    auto finishChunk = [&]() {
+        if (chunkIndices.empty()) return;
+        Mesh mesh = {};
+        mesh.vertexCount = (int)used.size();
+        mesh.triangleCount = (int)(chunkIndices.size()/3);
+        mesh.vertices = (float *)MemAlloc((unsigned)(3*used.size()*sizeof(float)));
+        mesh.texcoords = (float *)MemAlloc((unsigned)(2*used.size()*sizeof(float)));  // all 0, read by the shader
+        mesh.indices = (unsigned short *)MemAlloc((unsigned)(chunkIndices.size()*sizeof(unsigned short)));
+        if (!rgb.empty()) mesh.colors = (unsigned char *)MemAlloc((unsigned)(4*used.size()));
+        for (size_t k = 0; k < used.size(); k++) {
+            uint32_t v = used[k];
+            for (int a = 0; a < 3; a++) mesh.vertices[3*k + a] = (float)(xyz[a][v] - origin[a]);
+            if (mesh.colors) memcpy(&mesh.colors[4*k], &rgb[v], 4);
+            local[v] = -1;
+        }
+        memcpy(mesh.indices, chunkIndices.data(), chunkIndices.size()*sizeof(unsigned short));
+        UploadMesh(&mesh, false);
+        chunks.push_back(mesh);
+        used.clear();
+        chunkIndices.clear();
+    };
+    size_t faceCount = starts.empty() ? 0 : starts.size() - 1;
+    for (size_t f = 0; f < faceCount; f++) {
+        size_t first = starts[f], corners = starts[f + 1] - first;
+        for (size_t j = 1; j + 1 < corners; j++) {
+            uint32_t triangle[3] = { indices[first], indices[first + j], indices[first + j + 1] };
+            if (triangle[0] >= n || triangle[1] >= n || triangle[2] >= n) {
+                for (Mesh &mesh : chunks) UnloadMesh(mesh);
+                *problem = TextFormat("face %zu refers to a vertex the file does not have", f);
+                return false;
+            }
+            if (used.size() + 3 > MAX_CHUNK_VERTICES) finishChunk();  // room for 3 new vertices
+            for (uint32_t v : triangle) {
+                if (local[v] < 0) {
+                    local[v] = (int)used.size();
+                    used.push_back(v);
+                }
+                chunkIndices.push_back((unsigned short)local[v]);
+            }
+        }
+    }
+    finishChunk();
+    if (chunks.empty()) {
+        *problem = "it has no triangles";
+        return false;
+    }
+
+    *model = Model{};
+    model->transform = MatrixIdentity();
+    model->meshCount = (int)chunks.size();
+    model->meshes = (Mesh *)MemAlloc((unsigned)(chunks.size()*sizeof(Mesh)));
+    memcpy(model->meshes, chunks.data(), chunks.size()*sizeof(Mesh));
+    model->materialCount = 1;
+    model->materials = (Material *)MemAlloc(sizeof(Material));
+    model->materials[0] = LoadMaterialDefault();
+    model->meshMaterial = (int *)MemAlloc((unsigned)(chunks.size()*sizeof(int)));  // all 0: the one material
+    return true;
+}
+
+static void UnloadSceneMesh(SceneMesh *m)
+{
+    // raylib's UnloadModel leaves the materials' textures and shader to whoever made them. The
+    // textures are this file's own (some materials may share one); the shader is shared by all meshes.
+    std::vector<unsigned int> textures;
+    for (int i = 0; i < m->model.materialCount; i++) {
+        if (!m->model.materials[i].maps) continue;
+        for (int k = 0; k <= MATERIAL_MAP_BRDF; k++) {  // every map raylib.h names (raylib allocates a few more)
+            unsigned int id = m->model.materials[i].maps[k].texture.id;
+            if (id != 0 && id != rlGetTextureIdDefault() && std::find(textures.begin(), textures.end(), id) == textures.end())
+                textures.push_back(id);
+        }
+    }
+    for (unsigned int id : textures) rlUnloadTexture(id);
+    UnloadModel(m->model);
+}
+
+// Loads a mesh file to draw with `shader` (MESH_VS, MESH_FS). problem: why it failed.
+static bool LoadSceneMesh(const char *path, Shader shader, SceneMesh *out, std::string *problem)
+{
+    SceneMesh m = {};
+    m.path = path;
+    if (!FileExists(path)) {
+        *problem = "no such file";
+        return false;
+    }
+    if (IsFileExtension(path, ".ply")) {
+        if (!LoadPlyMesh(path, &m.model, m.origin, problem)) return false;
+    } else {
+        m.model = LoadModel(path);  // raylib reads .obj (with its .mtl), .gltf and .glb
+        if (m.model.meshCount == 0) {
+            UnloadSceneMesh(&m);
+            *problem = "no mesh found in it";
+            return false;
+        }
+        for (int i = 0; i < m.model.meshCount; i++) {
+            // raylib 5.5 reads 32-bit glTF indices into 16-bit ones, cutting off the high bits:
+            // the triangles of a mesh with more vertices than 16 bits number would come out wrong
+            if (m.model.meshes[i].indices && m.model.meshes[i].vertexCount > MAX_CHUNK_VERTICES) {
+                UnloadSceneMesh(&m);
+                *problem = "a mesh in it has more than 65536 vertices, which raylib 5.5 cannot index";
+                return false;
+            }
+        }
+    }
+    for (int i = 0; i < m.model.materialCount; i++) m.model.materials[i].shader = shader;
+    m.box = GetModelBoundingBox(m.model);
+    m.triangles = 0;
+    for (int i = 0; i < m.model.meshCount; i++) m.triangles += m.model.meshes[i].triangleCount;
+    TraceLog(LOG_INFO, "Loaded mesh %s: %ld triangles in %d raylib meshes", path, m.triangles, m.model.meshCount);
+    *out = m;
+    return true;
+}
+
+// The model transform of a mesh: from its coordinates to the scene's, which has `origin`
+// (where in its file the splats' (0, 0, 0) is) and was turned by `upAxis`. Move, then turn.
+static Matrix MeshTransform(const SceneMesh &m, UpAxis upAxis, const double origin[3])
+{
+    Matrix move = MatrixTranslate((float)(m.origin[0] - origin[0]), (float)(m.origin[1] - origin[1]),
+                                  (float)(m.origin[2] - origin[2]));
+    return MatrixMultiply(move, QuaternionToMatrix(UpAxisTurn(upAxis)));
+}
+
+// STEP 11, part 1: the meshes into the current target, with the depth test on.
+static void DrawSceneMeshes(const std::vector<SceneMesh> &meshes, UpAxis upAxis, const double origin[3],
+                            const ViewParams &view, Shader shader, bool wire)
+{
+    rlDrawRenderBatchActive();  // what raylib queued before this goes first, without depth
+    rlSetClipPlanes(view.zNear, view.zFar);
+    // the pinhole of STEP 4; raylib takes the aspect ratio from the target
+    Camera3D camera = { view.eye, Vector3Add(view.eye, view.forward), Vector3{ 0.0f, 1.0f, 0.0f },
+                        2.0f*atanf(view.tanHalfFovY)*RAD2DEG, CAMERA_PERSPECTIVE };
+    BeginMode3D(camera);  // also turns the depth test on
+    rlDisableBackfaceCulling();  // a mesh's triangles may face either way
+    int wireOn = wire;
+    SetShaderValue(shader, GetShaderLocation(shader, "wire"), &wireOn, SHADER_UNIFORM_INT);
+    if (wire) rlEnableWireMode();
+    for (const SceneMesh &m : meshes) {
+        Model model = m.model;  // a copy of the handles, to give it this view's transform
+        model.transform = MeshTransform(m, upAxis, origin);
+        DrawModel(model, Vector3Zero(), 1.0f, WHITE);
+    }
+    if (wire) rlDisableWireMode();
+    rlEnableBackfaceCulling();
+    EndMode3D();  // turns the depth test off again
+    rlSetClipPlanes(RL_CULL_DISTANCE_NEAR, RL_CULL_DISTANCE_FAR);
+}
+
+// ----------------------------------------------------------------------------
 // Helpers to aim the camera at a loaded scene: the median is robust to the
 // far-away background splats that real captures always contain.
 // ----------------------------------------------------------------------------
@@ -2086,6 +2460,7 @@ struct Scene {
     std::vector<Splat> splats;
     SphericalHarmonics sh;
     bool pointCloud = false;      // a plain point cloud .ply (STEP 2d)
+    double origin[3] = {};        // where in the file the splats' (0, 0, 0) is: a point cloud is moved there
     UpAxis upAxis = UP_PLUS_Y;    // the file's up direction, turned to +Y
     // the camera starts (and R puts it back) looking at `center` from `viewDistance` away
     Vector3 center = { 0.0f, 1.0f, 0.0f };
@@ -2108,7 +2483,7 @@ static bool LoadScene(const char *path, Scene *scene)
     // STEP 2: get splats
     if (!path) scene->splats = BuildDemoScene();
     else if (IsFileExtension(path, ".splat")) scene->splats = LoadSplatsFromSplatFile(path);
-    else scene->splats = LoadSplatsFromPly(path, &scene->sh, &scene->pointCloud);
+    else scene->splats = LoadSplatsFromPly(path, &scene->sh, &scene->pointCloud, scene->origin);
     if (scene->splats.empty()) return false;
     scene->name = path ? GetFileName(path) : "demo scene";
     scene->demo = !path;
@@ -2149,6 +2524,31 @@ static FlyCamera StartCamera(const Scene &scene)
     return CameraLookingAt(scene.center, scene.viewDistance, 0.6f, 0.35f);
 }
 
+// A scene of meshes alone (STEP 11), no splats: in the first mesh's coordinates, framed on
+// the box around all of them. Up is as their format usually has it: +Y for .obj and glTF
+// (whose standard says so), Z for a .ply, as for point clouds.
+static void MeshOnlyScene(Scene *scene, const std::vector<SceneMesh> &meshes)
+{
+    *scene = Scene{};
+    scene->name = "none, meshes only";
+    scene->upAxis = IsFileExtension(meshes[0].path.c_str(), ".ply") ? UP_PLUS_Z : UP_PLUS_Y;
+    memcpy(scene->origin, meshes[0].origin, sizeof scene->origin);
+    BoundingBox all = { Vector3{ INFINITY, INFINITY, INFINITY }, Vector3{ -INFINITY, -INFINITY, -INFINITY } };
+    for (const SceneMesh &m : meshes) {
+        Matrix toScene = MeshTransform(m, scene->upAxis, scene->origin);
+        for (int corner = 0; corner < 8; corner++) {  // the box's corners, turned
+            Vector3 p = { (corner & 1) ? m.box.max.x : m.box.min.x, (corner & 2) ? m.box.max.y : m.box.min.y,
+                          (corner & 4) ? m.box.max.z : m.box.min.z };
+            p = Vector3Transform(p, toScene);
+            all.min = Vector3Min(all.min, p);
+            all.max = Vector3Max(all.max, p);
+        }
+    }
+    scene->center = Vector3Scale(Vector3Add(all.min, all.max), 0.5f);
+    // far enough that a ball around the box fits the 60-degree view: 1/sin(30 deg) = 2 radii
+    scene->viewDistance = fmaxf(Vector3Distance(all.min, all.max), 1e-3f);
+}
+
 // Turn the scene so that `next` becomes its up axis (Z and F). The camera keeps
 // its direction and moves so that the point it looked at is in front of it
 // again, at the same distance: the same part of the scene stays in view.
@@ -2173,20 +2573,23 @@ static void SetUpAxis(Scene *scene, FlyCamera *cam, UpAxis next)
 // before the up-axis turn: viewers that turned the same file differently still
 // see the same part of it, from the same place.
 // ----------------------------------------------------------------------------
-static LinkedCamera ToLinkedCamera(const FlyCamera &cam, UpAxis up)
+// origin: the scene's, where in the file its (0, 0, 0) is.
+static LinkedCamera ToLinkedCamera(const FlyCamera &cam, UpAxis up, const double origin[3])
 {
     Quaternion unturn = QuaternionInvert(UpAxisTurn(up));
     Vector3 p = Vector3RotateByQuaternion(cam.position, unturn);
     Vector3 f = Vector3RotateByQuaternion(CameraForward(&cam), unturn);
-    return LinkedCamera{ { p.x, p.y, p.z }, { f.x, f.y, f.z }, cam.fovy, cam.speed };
+    return LinkedCamera{ { p.x + origin[0], p.y + origin[1], p.z + origin[2] }, { f.x, f.y, f.z }, cam.fovy,
+                         cam.speed };
 }
 
 // Back into this viewer's turned scene. The fly camera cannot roll, so a viewer
 // with another up axis sees the same view, rolled about its center.
-static FlyCamera FromLinkedCamera(const LinkedCamera &linked, UpAxis up)
+static FlyCamera FromLinkedCamera(const LinkedCamera &linked, UpAxis up, const double origin[3])
 {
     Quaternion turn = UpAxisTurn(up);
-    Vector3 p = { linked.position[0], linked.position[1], linked.position[2] };
+    Vector3 p = { (float)(linked.position[0] - origin[0]), (float)(linked.position[1] - origin[1]),
+                  (float)(linked.position[2] - origin[2]) };
     Vector3 f = { linked.forward[0], linked.forward[1], linked.forward[2] };
     f = Vector3Normalize(Vector3RotateByQuaternion(f, turn));
     FlyCamera cam;
@@ -2211,12 +2614,13 @@ static int LinkedViewMode(const CameraLink *link, bool syncView, const LinkedSta
 // of its own, with the file as its argument. It joins the camera link as it
 // starts, so it opens at the camera the others have. Not fork() alone: the copy
 // would share this viewer's window and OpenGL context, so it runs (exec) the
-// program afresh; posix_spawn does both.
+// program afresh; posix_spawn does both. The meshes of this viewer (STEP 11)
+// go along as arguments too, so that the new one shows them with its splats.
 // ----------------------------------------------------------------------------
-static bool OpenInNewViewer(const char *argv0, const char *path)
+static bool OpenInNewViewer(const char *argv0, const char *path, const std::vector<std::string> &meshPaths)
 {
 #ifdef _WIN32
-    (void)argv0; (void)path;
+    (void)argv0; (void)path; (void)meshPaths;
     return false;
 #else
 #ifdef __linux__
@@ -2224,10 +2628,26 @@ static bool OpenInNewViewer(const char *argv0, const char *path)
 #else
     std::string exe = std::string(GetApplicationDirectory()) + GetFileName(argv0);
 #endif
-    char *args[] = { const_cast<char *>(argv0), const_cast<char *>(path), NULL };
+    std::vector<char *> args = { const_cast<char *>(argv0), const_cast<char *>(path) };
+    for (const std::string &mesh : meshPaths) args.push_back(const_cast<char *>(mesh.c_str()));
+    args.push_back(NULL);
     pid_t pid;
-    return posix_spawn(&pid, exe.c_str(), NULL, NULL, args, environ) == 0;
+    return posix_spawn(&pid, exe.c_str(), NULL, NULL, args.data(), environ) == 0;
 #endif
+}
+
+static std::vector<std::string> MeshPaths(const std::vector<SceneMesh> &meshes)
+{
+    std::vector<std::string> paths;
+    for (const SceneMesh &m : meshes) paths.push_back(m.path);
+    return paths;
+}
+
+// What to show and log for a mesh file that could not be loaded
+static std::string MeshLoadFailed(const char *path, const std::string &problem)
+{
+    TraceLog(LOG_ERROR, "Cannot open mesh %s: %s", path, problem.c_str());
+    return TextFormat("Cannot open %s: %s", GetFileName(path), problem.c_str());
 }
 
 // Collects the viewers this one started that have quit, so none lingers as a zombie process.
@@ -2301,6 +2721,7 @@ struct RenderOptions {
     Renderer renderer;
     bool sortEnabled, shEnabled, flatQuads;
     float scaleMod, dotSize, drawSigma;
+    MeshDraw meshDraw;  // STEP 11
 };
 
 struct RenderStats {
@@ -2387,6 +2808,28 @@ static RenderStats RenderSplats(Scene &scene, const ViewParams &view, Vector2 sc
     return RenderStats{ visibleCount, (t1 - t0)*1000.0, (t2 - t1)*1000.0, (t3 - t2)*1000.0 };
 }
 
+// One view of everything, the meshes and the splats (STEP 11), into the current target.
+static RenderStats RenderView(Scene &scene, const std::vector<SceneMesh> &meshes, Shader meshShader,
+                              const ViewParams &view, Vector2 screen, const RenderOptions &o,
+                              std::vector<unsigned int> &buckets, Shader shader, int modeLoc)
+{
+    bool shaded = !meshes.empty() && o.meshDraw == MESH_SHADED;
+    if (shaded) {
+        DrawSceneMeshes(meshes, scene.upAxis, scene.origin, view, meshShader, false);  // 1. their depth
+        rlEnableDepthTest();   // 2. the splats are tested against it,
+        rlDisableDepthMask();  //    and write none: they do not hide one another, the sort orders them
+    }
+    RenderStats stats = RenderSplats(scene, view, screen, o, buckets, shader, modeLoc);
+    if (shaded) {
+        rlEnableDepthMask();
+        rlDisableDepthTest();
+    }
+    if (!meshes.empty() && o.meshDraw == MESH_WIRE) {
+        DrawSceneMeshes(meshes, scene.upAxis, scene.origin, view, meshShader, true);  // over the splats
+    }
+    return stats;
+}
+
 // ----------------------------------------------------------------------------
 // C: every view from this camera in one picture, a sheet of 4 x 2 at half the
 // window size each (CAPTURE_SCALE), with each view's name, saved as
@@ -2395,7 +2838,8 @@ static RenderStats RenderSplats(Scene &scene, const ViewParams &view, Vector2 sc
 // ----------------------------------------------------------------------------
 #define CAPTURE_SCALE 0.5f  // each view's size on the sheet, relative to the window
 
-static std::string CaptureAllViews(Scene &scene, const ViewParams &view, Vector2 screen, RenderOptions o,
+static std::string CaptureAllViews(Scene &scene, const std::vector<SceneMesh> &meshes, Shader meshShader,
+                                   const ViewParams &view, Vector2 screen, RenderOptions o,
                                    std::vector<unsigned int> &buckets, Shader shader, int modeLoc)
 {
     const Color background = { 20, 20, 26, 255 };
@@ -2408,7 +2852,7 @@ static std::string CaptureAllViews(Scene &scene, const ViewParams &view, Vector2
         o.mode = (ViewMode)m;
         BeginTextureMode(target);
         ClearBackground(background);
-        RenderSplats(scene, view, screen, o, buckets, shader, modeLoc);
+        RenderView(scene, meshes, meshShader, view, screen, o, buckets, shader, modeLoc);
         EndTextureMode();
         Image frame = LoadImageFromTexture(target.texture);
         ImageFlipVertical(&frame);  // render textures are stored bottom row first
@@ -2439,12 +2883,23 @@ static std::string CaptureAllViews(Scene &scene, const ViewParams &view, Vector2
 // ----------------------------------------------------------------------------
 int main(int argc, char **argv)
 {
-    const char *path = (argc > 1) ? argv[1] : NULL;
+    // The files on the command line. The meshes (STEP 11) all go with the splats. Of the
+    // splat files, this viewer opens the first.
+    const char *path = NULL;  // the splat file; NULL: the demo scene, or meshes alone
+    std::vector<const char *> otherSplatFiles;
+    std::vector<std::string> meshFiles;
+    for (int i = 1; i < argc; i++) {
+        if (IsMeshFile(argv[i])) meshFiles.push_back(argv[i]);
+        else if (!IsFileExtension(argv[i], ".ply;.splat")) TraceLog(LOG_WARNING, "Neither splats nor a mesh: %s", argv[i]);
+        else if (!path) path = argv[i];
+        else otherSplatFiles.push_back(argv[i]);
+    }
+
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
     // Created with the plain title, then renamed: on X11 the first title also becomes the
     // window's class, which the taskbar groups windows by, so every viewer keeps one class.
     InitWindow(1280, 800, WindowTitle(NULL).c_str());
-    SetWindowTitle(WindowTitle(path).c_str());
+    SetWindowTitle(WindowTitle(path ? path : meshFiles.empty() ? NULL : meshFiles[0].c_str()).c_str());
 
     // Join the camera link first: a viewer that joins connects while its scene loads,
     // and so has the others' camera from its first frame.
@@ -2453,17 +2908,37 @@ int main(int argc, char **argv)
     CameraLink *link = OpenCameraLink();   // NULL when built without ZeroMQ
     LinkedState shared = { {}, -1 };       // what the link shares, as of this frame
 
-    // Several files on the command line: this viewer opens the first, and every other one
-    // opens in a new viewer, linked to this one. Started now, they all load at once.
-    for (int i = 2; i < argc; i++) {
-        if (!IsFileExtension(argv[i], ".ply;.splat")) TraceLog(LOG_WARNING, "Not a .ply or .splat: %s", argv[i]);
-        else if (!OpenInNewViewer(argv[0], argv[i])) TraceLog(LOG_WARNING, "Could not start a viewer for %s", argv[i]);
+    // Several splat files: every one after the first opens in a new viewer, linked to this
+    // one, with the same meshes. Started now, they all load at once.
+    for (const char *other : otherSplatFiles) {
+        if (!OpenInNewViewer(argv[0], other, meshFiles)) TraceLog(LOG_WARNING, "Could not start a viewer for %s", other);
     }
 
     Scene scene;
-    if (path) DrawLoadingScreen(path);
-    if (!LoadScene(path, &scene)) { CloseCameraLink(link); CloseWindow(); return 1; }
+    if (path || meshFiles.empty()) {  // the splat file, or else the demo scene
+        if (path) DrawLoadingScreen(path);
+        if (!LoadScene(path, &scene)) { CloseCameraLink(link); CloseWindow(); return 1; }
+    }
     std::string dropFailed;  // name of the last dropped file, if it could not be loaded
+    std::string notice;      // what C, a drop or a mesh that could not be loaded did, shown for a few seconds
+    double noticeTime = -100.0;
+
+    // STEP 11: the meshes, drawn with whatever splats this viewer shows
+    Shader meshShader = LoadShaderFromMemory(MESH_VS, MESH_FS);
+    std::vector<SceneMesh> meshes;
+    MeshDraw meshDraw = MESH_SHADED;  // T
+    for (const std::string &file : meshFiles) {
+        DrawLoadingScreen(file.c_str());
+        SceneMesh m;
+        std::string problem;
+        if (LoadSceneMesh(file.c_str(), meshShader, &m, &problem)) meshes.push_back(m);
+        else { notice = MeshLoadFailed(file.c_str(), problem); noticeTime = GetTime(); }
+    }
+    if (!path && !meshFiles.empty()) {  // meshes alone
+        if (meshes.empty()) { UnloadShader(meshShader); CloseCameraLink(link); CloseWindow(); return 1; }
+        MeshOnlyScene(&scene, meshes);
+        SetWindowTitle(WindowTitle(meshes[0].path.c_str()).c_str());
+    }
 
     std::vector<unsigned int> buckets(SORT_BUCKETS);  // sort working memory, the same for every scene
     Shader shader = LoadShaderFromMemory(QUAD_VS, SPLAT_FS);
@@ -2477,8 +2952,6 @@ int main(int argc, char **argv)
     bool flatQuads = false;  // B: show the quads the vertex shader draws, filled flat
     const float DRAW_SIGMA = 2.0f;
     float drawSigma = DRAW_SIGMA;  // [ and ]: the k of the k-sigma ellipses and ellipsoids of views 2, 4, 5
-    std::string notice;            // what C or a drop did, shown for a few seconds
-    double noticeTime = -100.0;
     Renderer renderer = FirstRenderer(scene);
     bool shEnabled = (scene.sh.degree > 0);
     float scaleMod = 1.0f;
@@ -2491,25 +2964,51 @@ int main(int argc, char **argv)
         // viewer syncs views (M). Then note where the camera is, to tell after input
         // whether this viewer moved it (R and a dropped file too) ----
         int changed = ReceiveLinked(link, &shared);
-        if (changed & LINKED_CAMERA) cam = FromLinkedCamera(shared.camera, scene.upAxis);
+        if (changed & LINKED_CAMERA) cam = FromLinkedCamera(shared.camera, scene.upAxis, scene.origin);
         int linkedView = LinkedViewMode(link, syncView, shared);
         if ((changed & LINKED_VIEW_MODE) && linkedView >= 0) mode = (ViewMode)linkedView;
-        LinkedCamera camBefore = ToLinkedCamera(cam, scene.upAxis);
+        LinkedCamera camBefore = ToLinkedCamera(cam, scene.upAxis, scene.origin);
 
         // ---- drag and drop: a .ply or .splat dropped on the window opens it. The demo
-        // scene, or a viewer whose camera is not linked (L), loads the file in its place.
-        // A linked viewer that already shows a file opens it in a new viewer instead,
-        // which takes the shared camera: the two then fly together. Of several files
-        // dropped at once, the second and later always open in new viewers. ----
+        // scene, a viewer of meshes alone, or one whose camera is not linked (L), loads the
+        // file in its place. A linked viewer that already shows a file opens it in a new
+        // viewer instead, which takes the shared camera, and this viewer's meshes: the two
+        // then fly together. Of several splat files dropped at once, the second and later
+        // always open in new viewers. A mesh (STEP 11) joins this viewer's meshes, linked
+        // or not; on the demo scene, it takes the place of the demo's splats. ----
         if (IsFileDropped()) {
             FilePathList dropped = LoadDroppedFiles();
             std::vector<std::string> paths(dropped.paths, dropped.paths + dropped.count);
             UnloadDroppedFiles(dropped);
+            int splatFiles = 0;  // of this drop, so far
             for (size_t i = 0; i < paths.size(); i++) {
                 const char *name = GetFileName(paths[i].c_str());
-                if (i > 0 || (link && !scene.demo)) {
-                    if (!IsFileExtension(name, ".ply;.splat")) { dropFailed = name; continue; }
-                    notice = OpenInNewViewer(argv[0], paths[i].c_str())
+                if (IsMeshFile(paths[i].c_str())) {
+                    DrawLoadingScreen(paths[i].c_str());
+                    SceneMesh m;
+                    std::string problem;
+                    noticeTime = GetTime();
+                    if (!LoadSceneMesh(paths[i].c_str(), meshShader, &m, &problem)) {
+                        notice = MeshLoadFailed(paths[i].c_str(), problem);
+                        continue;
+                    }
+                    meshes.push_back(m);
+                    meshDraw = MESH_SHADED;  // shown, even if T hid the others
+                    notice = TextFormat("Added mesh %s", name);
+                    if (scene.demo) {
+                        UnloadScene(&scene);
+                        MeshOnlyScene(&scene, meshes);
+                        cam = StartCamera(scene);
+                        renderer = FirstRenderer(scene);
+                        shEnabled = false;
+                        SetWindowTitle(WindowTitle(paths[i].c_str()).c_str());
+                    }
+                    continue;
+                }
+                if (!IsFileExtension(name, ".ply;.splat")) { dropFailed = name; continue; }
+                bool inPlace = (splatFiles++ == 0) && (!link || scene.demo || scene.splats.empty());
+                if (!inPlace) {
+                    notice = OpenInNewViewer(argv[0], paths[i].c_str(), MeshPaths(meshes))
                                  ? TextFormat("Opened %s in a new viewer", name)
                                  : TextFormat("Could not start a new viewer for %s", name);
                     noticeTime = GetTime();
@@ -2588,6 +3087,7 @@ int main(int argc, char **argv)
         if (mode == VIEW_CENTERS) dotSize = Clamp(dotSize*grow, 1.0f, 20.0f);
         else scaleMod = Clamp(scaleMod*grow, 0.01f, 4.0f);
         if (IsKeyPressed(KEY_G)) renderer = NextRenderer(scene, renderer);
+        if (IsKeyPressed(KEY_T) && !meshes.empty()) meshDraw = (MeshDraw)((meshDraw + 1) % MESH_DRAW_COUNT);
         // Z swaps Z up and Z front, F cycles through all the up axes
         if (IsKeyPressed(KEY_Z)) SetUpAxis(&scene, &cam, (scene.upAxis == UP_PLUS_Z) ? UP_MINUS_Y : UP_PLUS_Z);
         if (IsKeyPressed(KEY_F)) SetUpAxis(&scene, &cam, (UpAxis)((scene.upAxis + 1) % UP_AXIS_COUNT));
@@ -2608,26 +3108,27 @@ int main(int argc, char **argv)
             if (last >= 0) mode = (ViewMode)last;
         }
         // compared in the file's coordinates, so turning the scene (Z, F) counts as a move too
-        LinkedCamera camAfter = ToLinkedCamera(cam, scene.upAxis);
+        LinkedCamera camAfter = ToLinkedCamera(cam, scene.upAxis, scene.origin);
         int changedHere = 0;
-        if (memcmp(&camBefore, &camAfter, sizeof camAfter) != 0) changedHere |= LINKED_CAMERA;
+        if (camBefore != camAfter) changedHere |= LINKED_CAMERA;
         if (picked >= 0 && syncView) changedHere |= LINKED_VIEW_MODE;
         SendLinked(link, LinkedState{ camAfter, mode }, changedHere);
         view = MakeView(&cam, GetScreenWidth(), GetScreenHeight());
 
-        RenderOptions options = { mode, renderer, sortEnabled, shEnabled, flatQuads, scaleMod, dotSize, drawSigma };
+        RenderOptions options = { mode,     renderer, sortEnabled, shEnabled, flatQuads,
+                                  scaleMod, dotSize,  drawSigma,   meshDraw };
         Vector2 screen = { (float)GetScreenWidth(), (float)GetScreenHeight() };
         if (IsKeyPressed(KEY_C)) {  // every view from here, in one picture
-            notice = CaptureAllViews(scene, view, screen, options, buckets, shader, modeLoc);
+            notice = CaptureAllViews(scene, meshes, meshShader, view, screen, options, buckets, shader, modeLoc);
             noticeTime = GetTime();
         }
 
         BeginDrawing();
         ClearBackground(Color{ 20, 20, 26, 255 });
-        RenderStats stats = RenderSplats(scene, view, screen, options, buckets, shader, modeLoc);
+        RenderStats stats = RenderView(scene, meshes, meshShader, view, screen, options, buckets, shader, modeLoc);
 
         // ---- HUD ----
-        DrawRectangle(8, 8, 400, 382, Fade(BLACK, 0.6f));
+        DrawRectangle(8, 8, 400, 402, Fade(BLACK, 0.6f));
         DrawText(TextFormat("%d FPS   %d / %d %s visible", GetFPS(), stats.visible, count,
                             scene.pointCloud ? "points" : "splats"), 16, 16, 18, RAYWHITE);
         double cpuMs[3] = { stats.projectMs, stats.sortMs, stats.drawMs };
@@ -2641,7 +3142,9 @@ int main(int argc, char **argv)
                                                 scene.pointCloud ? " (point cloud)" : "")
                                     : TextFormat("[drop] file:    cannot open %s", dropFailed.c_str()), 16, 66, 16,
                  dropFailed.empty() ? RAYWHITE : ORANGE);
-        DrawText(TextFormat("[G] renderer:   %s", scene.gpuReady ? rendererNames[renderer] : "CPU (GPU unavailable)"),
+        DrawText(TextFormat("[G] renderer:   %s", count == 0      ? "none (no splats)"
+                                                  : scene.gpuReady ? rendererNames[renderer]
+                                                                   : "CPU (GPU unavailable)"),
                  16, 86, 16, (renderer != FirstRenderer(scene)) ? ORANGE : RAYWHITE);
         DrawText(TextFormat("[1-7] view:     %s", viewNames[mode]), 16, 106, 16, RAYWHITE);
         DrawText(TextFormat("[O] sort:       %s", sortEnabled ? "on (back to front)" : "OFF (file order)"), 16, 126, 16,
@@ -2659,14 +3162,22 @@ int main(int argc, char **argv)
         DrawText(TextFormat("[ ] sigma:      %.1f (views 2, 4, 5)", drawSigma), 16, 246, 16,
                  (drawSigma != DRAW_SIGMA) ? ORANGE : RAYWHITE);
         DrawText("[R] reset camera", 16, 266, 16, RAYWHITE);
+        long triangles = 0;
+        for (const SceneMesh &m : meshes) triangles += m.triangles;
+        DrawText(meshes.empty() ? "[T] meshes:     none (drop .obj .gltf .glb .ply)"
+                                : TextFormat("[T] meshes:     %s, %s triangles (%d %s)", meshDrawNames[meshDraw],
+                                             (triangles >= 1000000) ? TextFormat("%.1fM", triangles/1e6)
+                                                                    : TextFormat("%ld", triangles),
+                                             (int)meshes.size(), (meshes.size() == 1) ? "file" : "files"),
+                 16, 286, 16, (!meshes.empty() && meshDraw != MESH_SHADED) ? ORANGE : RAYWHITE);
         DrawText(!linkOn ? "[L/M] link:     OFF (nothing shared)"
                  : !link ? "[L/M] link:     none (built without ZeroMQ)"
                          : TextFormat("[L/M] link:     %s (%s)", syncView ? "camera + view" : "camera only",
-                                      CameraLinkRole(link)), 16, 286, 16,
+                                      CameraLinkRole(link)), 16, 306, 16,
                  (link && syncView) ? RAYWHITE : ORANGE);
-        DrawText("WASD move  Q/E down/up  LMB/RMB look", 16, 314, 16, LIGHTGRAY);
-        DrawText("MMB pan  Shift fast  Ctrl slow", 16, 334, 16, LIGHTGRAY);
-        DrawText("C all views  F12 screenshot  Esc quit", 16, 354, 16, LIGHTGRAY);
+        DrawText("WASD move  Q/E down/up  LMB/RMB look", 16, 334, 16, LIGHTGRAY);
+        DrawText("MMB pan  Shift fast  Ctrl slow", 16, 354, 16, LIGHTGRAY);
+        DrawText("C all views  F12 screenshot  Esc quit", 16, 374, 16, LIGHTGRAY);
         if (GetTime() - noticeTime < 4.0) {
             int width = MeasureText(notice.c_str(), 18) + 16;
             DrawRectangle(8, GetScreenHeight() - 40, width, 32, Fade(BLACK, 0.6f));
@@ -2674,16 +3185,18 @@ int main(int argc, char **argv)
         }
         if (mode == VIEW_LINEARIZATION_ERROR) {
             // the color scale of view 5 (STEP 6d): Hellinger distance, linearized vs exact
-            DrawRectangle(8, 394, 400, 30, Fade(BLACK, 0.6f));
-            DrawText("exact", 16, 401, 16, RAYWHITE);
-            for (int x = 0; x < 240; x++) DrawRectangle(70 + x, 402, 1, 14, RampColor(x/239.0f));
-            DrawText(TextFormat(">= %.1f off", LINEARIZATION_RED), 318, 401, 16, RAYWHITE);
+            DrawRectangle(8, 414, 400, 30, Fade(BLACK, 0.6f));
+            DrawText("exact", 16, 421, 16, RAYWHITE);
+            for (int x = 0; x < 240; x++) DrawRectangle(70 + x, 422, 1, 14, RampColor(x/239.0f));
+            DrawText(TextFormat(">= %.1f off", LINEARIZATION_RED), 318, 421, 16, RAYWHITE);
         }
         EndDrawing();
     }
 
     CloseCameraLink(link);
     UnloadScene(&scene);
+    for (SceneMesh &m : meshes) UnloadSceneMesh(&m);
+    UnloadShader(meshShader);
     UnloadShader(shader);
     CloseWindow();
     return 0;
